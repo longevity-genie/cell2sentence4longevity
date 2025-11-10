@@ -22,6 +22,18 @@ uv run cell2sentence run-all "$H5AD_FILE" \
   --log-file ./logs/pipeline.log
 
 echo ""
+echo "Example 1b: Run pipeline without train/test split"
+echo "=================================================="
+echo "This creates a single parquet dataset without splitting,"
+echo "allowing HuggingFace users to decide on their own splitting strategy."
+uv run cell2sentence run-all "$H5AD_FILE" \
+  --output-dir "$OUTPUT_DIR" \
+  --repo-id "$REPO_ID" \
+  --token "$HF_TOKEN" \
+  --skip-train-test-split \
+  --log-file ./logs/pipeline_no_split.log
+
+echo ""
 echo "Example 2: Run individual steps"
 echo "=================================="
 

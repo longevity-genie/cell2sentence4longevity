@@ -320,6 +320,11 @@ def run_all(
         "--test-size",
         help="Proportion of data for test set"
     ),
+    skip_train_test_split: bool = typer.Option(
+        False,
+        "--skip-train-test-split",
+        help="Skip train/test split and produce single parquet dataset (default: False)"
+    ),
     log_file: Optional[Path] = typer.Option(
         Path("./logs/pipeline.log"),
         "--log-file",
@@ -333,8 +338,11 @@ def run_all(
     1. Create HGNC mapper
     2. Convert h5ad to parquet
     3. Add age and cleanup
-    4. Create train/test split
+    4. Create train/test split (optional, can be skipped with --skip-train-test-split)
     5. Upload to HuggingFace (if repo_id and token provided)
+    
+    If --skip-train-test-split is used, the data will remain in a single parquet directory,
+    allowing users on HuggingFace to decide on their own splitting strategy.
     """
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -368,20 +376,27 @@ def run_all(
         add_age_and_cleanup(parquet_dir)
         typer.secho("✓ Step 3 complete\n", fg=typer.colors.GREEN)
         
-        # Step 4
-        typer.echo("="*80)
-        typer.echo("STEP 4: Creating train/test split")
-        typer.echo("="*80)
-        data_splits_dir = output_dir / "data_splits"
-        create_train_test_split(parquet_dir, data_splits_dir, test_size, 42, chunk_size)
-        typer.secho("✓ Step 4 complete\n", fg=typer.colors.GREEN)
+        # Step 4 (optional, based on skip_train_test_split flag)
+        if skip_train_test_split:
+            typer.echo("\n⚠ Skipping Step 4 (train/test split) - data will remain in single parquet directory")
+            # Data for upload is in parquet_dir
+            upload_dir = parquet_dir
+        else:
+            typer.echo("="*80)
+            typer.echo("STEP 4: Creating train/test split")
+            typer.echo("="*80)
+            data_splits_dir = output_dir / "data_splits"
+            create_train_test_split(parquet_dir, data_splits_dir, test_size, 42, chunk_size)
+            typer.secho("✓ Step 4 complete\n", fg=typer.colors.GREEN)
+            # Data for upload is in data_splits_dir
+            upload_dir = data_splits_dir
         
         # Step 5 (optional)
         if repo_id and token:
             typer.echo("="*80)
             typer.echo("STEP 5: Uploading to HuggingFace")
             typer.echo("="*80)
-            upload_to_huggingface(data_splits_dir, token, repo_id, None)
+            upload_to_huggingface(upload_dir, token, repo_id, None)
             typer.secho("✓ Step 5 complete\n", fg=typer.colors.GREEN)
             typer.echo(f"Dataset: https://huggingface.co/datasets/{repo_id}")
         else:

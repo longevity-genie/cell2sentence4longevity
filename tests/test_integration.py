@@ -100,8 +100,7 @@ class TestIntegrationPipeline:
             
             h5ad_path = download_dataset(
                 url=url,
-                output_dir=temp_dirs['input'],
-                filename="test_dataset.h5ad"
+                output_dir=temp_dirs['input']
             )
             
             # Validate download
@@ -296,8 +295,7 @@ class TestIntegrationPipeline:
             url = "https://datasets.cellxgene.cziscience.com/9deda9ad-6a71-401e-b909-5263919d85f9.h5ad"
             h5ad_path = download_dataset(
                 url=url,
-                output_dir=temp_dirs['input'],
-                filename="test_dataset.h5ad"
+                output_dir=temp_dirs['input']
             )
             
             # Create mapper (optional)

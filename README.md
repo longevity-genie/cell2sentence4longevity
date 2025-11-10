@@ -90,6 +90,12 @@ uv run preprocess run-all /path/to/file.h5ad \
   --interim-dir ./data/interim \
   --output-dir ./data/output \
   --repo-id "username/dataset-name"  # Optional, for upload
+
+# Skip train/test split (produce single parquet dataset)
+# Useful when you want HuggingFace users to decide on their own splitting
+uv run preprocess run-all /path/to/file.h5ad \
+  --skip-train-test-split \
+  --output-dir ./data/output
 ```
 
 ### Run Individual Steps
@@ -120,7 +126,9 @@ uv run preprocess step2-convert-h5ad /path/to/file.h5ad \
 uv run preprocess step3-add-age --interim-dir ./data/interim/parquet_chunks
 ```
 
-#### Step 4: Create Train/Test Split
+#### Step 4: Create Train/Test Split (Optional)
+
+This step can be skipped if you want users on HuggingFace to decide on their own splitting strategy. Use `--skip-train-test-split` flag in the `run-all` command, or omit this step entirely when running individual steps.
 
 ```bash
 uv run preprocess step4-train-test-split \
