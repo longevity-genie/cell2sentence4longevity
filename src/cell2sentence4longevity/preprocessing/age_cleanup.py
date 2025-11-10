@@ -31,19 +31,34 @@ def add_age_and_cleanup(parquet_dir: Path) -> None:
     """Add age column and cleanup column names.
     
     Args:
-        parquet_dir: Directory containing parquet chunks
+        parquet_dir: Directory containing parquet chunks (can be dataset_name/chunks/ or flat)
     """
-    with start_action(action_type="add_age_and_cleanup", parquet_dir=str(parquet_dir)) as action:
+    # Determine chunks directory - handle both old and new structures
+    if (parquet_dir / "chunk_0000.parquet").exists() or list(parquet_dir.glob("chunk_*.parquet")):
+        # Direct chunks directory
+        chunks_dir = parquet_dir
+    elif (parquet_dir / "chunks" / "chunk_0000.parquet").exists():
+        # New structure: parquet_dir is dataset_name, chunks are in dataset_name/chunks/
+        chunks_dir = parquet_dir / "chunks"
+    else:
+        # Fallback: assume it's the chunks directory
+        chunks_dir = parquet_dir
+    
+    with start_action(action_type="add_age_and_cleanup", parquet_dir=str(parquet_dir), chunks_dir=str(chunks_dir)) as action:
         # Find all parquet files
-        parquet_files = sorted(list(parquet_dir.glob("chunk_*.parquet")))
+        parquet_files = sorted(list(chunks_dir.glob("chunk_*.parquet")))
         action.log(message_type="found_parquet_files", count=len(parquet_files))
+        
+        if len(parquet_files) == 0:
+            action.log(message_type="no_parquet_files_found", parquet_dir=str(parquet_dir), chunks_dir=str(chunks_dir))
+            return
         
         # Check if age column already exists by checking schema (no data loading)
         schema = pl.scan_parquet(parquet_files[0]).collect_schema()
         needs_age = 'age' not in schema
         
         # Count total cells before processing
-        lazy_dataset = pl.scan_parquet(parquet_dir / "chunk_*.parquet")
+        lazy_dataset = pl.scan_parquet(chunks_dir / "chunk_*.parquet")
         total_cells_before = lazy_dataset.select(pl.count()).collect().item()
         action.log(message_type="total_cells_before_age_extraction", count=total_cells_before)
         
@@ -82,7 +97,7 @@ def add_age_and_cleanup(parquet_dir: Path) -> None:
         
         if 'age' in final_schema:
             # Use lazy API for age distribution and null counting
-            lazy_dataset = pl.scan_parquet(parquet_dir / "chunk_*.parquet")
+            lazy_dataset = pl.scan_parquet(chunks_dir / "chunk_*.parquet")
             
             # Count cells with null age
             null_age_count = (

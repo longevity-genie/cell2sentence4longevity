@@ -8,26 +8,69 @@ from eliot import start_action
 from tqdm import tqdm
 
 
+DEFAULT_REPO_ID = "longevity-genie/cell2sentence4longevity-data"
+
+
 def upload_to_huggingface(
     data_splits_dir: Path,
-    repo_id: str,
     token: str,
-    readme_path: Path | None = None,
-    max_workers: int = 8
+    repo_id: str = DEFAULT_REPO_ID,
+    dataset_name: str | None = None,
+    readme_path: Path | None = None
 ) -> None:
     """Upload train/test splits to HuggingFace hub in a single commit.
     
     Args:
-        data_splits_dir: Directory containing train/test subdirectories
-        repo_id: HuggingFace repository ID (e.g., 'username/dataset-name')
+        data_splits_dir: Directory containing train/test subdirectories or dataset_name/train/chunks/ structure
         token: HuggingFace API token
+        repo_id: HuggingFace repository ID (e.g., 'username/dataset-name'). 
+                 Defaults to 'longevity-genie/cell2sentence4longevity-data'
+        dataset_name: Name of the dataset. If None, inferred from directory structure
         readme_path: Optional path to README file
-        max_workers: Number of parallel upload threads (unused, kept for backwards compatibility)
     """
+    # Determine dataset name and directory structure
+    # Check for new structure: dataset_name/train/chunks/ and dataset_name/test/chunks/
+    if dataset_name is None:
+        # Try to infer from directory structure
+        if (data_splits_dir / "train" / "chunks" / "chunk_0000.parquet").exists():
+            # New structure: data_splits_dir is output_dir, need to find dataset_name
+            # Look for subdirectories that have train/chunks/
+            for subdir in data_splits_dir.iterdir():
+                if subdir.is_dir() and (subdir / "train" / "chunks").exists():
+                    dataset_name = subdir.name
+                    break
+        elif (data_splits_dir / "train" / "chunk_0000.parquet").exists():
+            # Old structure: data_splits_dir/train/ and data_splits_dir/test/
+            dataset_name = "dataset"
+        else:
+            # Assume it's the dataset directory itself
+            dataset_name = data_splits_dir.name
+    
+    # Determine train and test chunk directories
+    if (data_splits_dir / dataset_name / "train" / "chunks" / "chunk_0000.parquet").exists():
+        # New structure: data_splits_dir/dataset_name/train/chunks/
+        train_chunks_dir = data_splits_dir / dataset_name / "train" / "chunks"
+        test_chunks_dir = data_splits_dir / dataset_name / "test" / "chunks"
+    elif (data_splits_dir / "train" / "chunks" / "chunk_0000.parquet").exists():
+        # New structure: data_splits_dir is dataset_name, train/chunks/ and test/chunks/
+        train_chunks_dir = data_splits_dir / "train" / "chunks"
+        test_chunks_dir = data_splits_dir / "test" / "chunks"
+    elif (data_splits_dir / "train" / "chunk_0000.parquet").exists():
+        # Old structure: data_splits_dir/train/ and data_splits_dir/test/
+        train_chunks_dir = data_splits_dir / "train"
+        test_chunks_dir = data_splits_dir / "test"
+    else:
+        # Fallback: assume chunks are directly in train/ and test/
+        train_chunks_dir = data_splits_dir / "train"
+        test_chunks_dir = data_splits_dir / "test"
+    
     with start_action(
         action_type="upload_to_huggingface",
         repo_id=repo_id,
-        data_splits_dir=str(data_splits_dir)
+        data_splits_dir=str(data_splits_dir),
+        dataset_name=dataset_name,
+        train_chunks_dir=str(train_chunks_dir),
+        test_chunks_dir=str(test_chunks_dir)
     ) as action:
         # Login to HuggingFace
         action.log(message_type="logging_in")
@@ -65,11 +108,10 @@ def upload_to_huggingface(
             )
         
         # Prepare train files
-        train_dir = data_splits_dir / "train"
-        train_files = sorted(list(train_dir.glob("chunk_*.parquet")))
+        train_files = sorted(list(train_chunks_dir.glob("chunk_*.parquet"))) if train_chunks_dir.exists() else []
         train_to_upload = []
         for filepath in train_files:
-            repo_path = f'data/train/{filepath.name}'
+            repo_path = f'data/{dataset_name}/train/chunks/{filepath.name}'
             if repo_path not in existing_files:
                 train_to_upload.append(filepath)
                 operations.append(
@@ -82,15 +124,15 @@ def upload_to_huggingface(
         action.log(
             message_type="train_files_prepared",
             total=len(train_files),
-            to_upload=len(train_to_upload)
+            to_upload=len(train_to_upload),
+            train_chunks_dir=str(train_chunks_dir)
         )
         
         # Prepare test files
-        test_dir = data_splits_dir / "test"
-        test_files = sorted(list(test_dir.glob("chunk_*.parquet")))
+        test_files = sorted(list(test_chunks_dir.glob("chunk_*.parquet"))) if test_chunks_dir.exists() else []
         test_to_upload = []
         for filepath in test_files:
-            repo_path = f'data/test/{filepath.name}'
+            repo_path = f'data/{dataset_name}/test/chunks/{filepath.name}'
             if repo_path not in existing_files:
                 test_to_upload.append(filepath)
                 operations.append(
@@ -103,7 +145,8 @@ def upload_to_huggingface(
         action.log(
             message_type="test_files_prepared",
             total=len(test_files),
-            to_upload=len(test_to_upload)
+            to_upload=len(test_to_upload),
+            test_chunks_dir=str(test_chunks_dir)
         )
         
         # Upload all files in a single commit

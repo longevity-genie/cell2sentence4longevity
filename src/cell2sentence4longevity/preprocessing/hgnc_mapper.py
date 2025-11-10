@@ -21,17 +21,21 @@ def download_hgnc_data(output_dir: Path) -> pl.DataFrame | None:
     """
     with start_action(action_type="download_hgnc_data") as action:
         urls = [
-            "https://g-a8b222.dd271.03c0.data.globus.org/pub/databases/genenames/hgnc/tsv/hgnc_complete_set.txt",
-            "http://ftp.ebi.ac.uk/pub/databases/genenames/new/tsv/hgnc_complete_set.txt",
+            # Current location (as of 2024) - Google Cloud Storage
+            "https://storage.googleapis.com/public-download-files/hgnc/tsv/hgnc_complete_set.txt",
+            # Legacy EBI FTP location (fallback)
+            "https://ftp.ebi.ac.uk/pub/databases/genenames/hgnc/tsv/hgnc_complete_set.txt",
         ]
-        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; cell2sentence4longevity/0.1)"
+        }
         output_file = output_dir / "hgnc_complete_set.tsv"
         
         for i, url in enumerate(urls, 1):
             action.log(message_type="attempt_download", attempt=i, total=len(urls), url=url)
             
             try:
-                response = requests.get(url, timeout=120)
+                response = requests.get(url, timeout=120, headers=headers)
                 response.raise_for_status()
                 
                 # Use Polars to read the TSV data

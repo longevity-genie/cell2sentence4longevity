@@ -88,6 +88,21 @@ def step2_convert_h5ad(
         "-t",
         help="Number of top expressed genes per cell"
     ),
+    compression: str = typer.Option(
+        "zstd",
+        "--compression",
+        help="Compression algorithm for parquet files. Options: uncompressed, snappy, gzip, lzo, brotli, lz4, zstd"
+    ),
+    compression_level: int = typer.Option(
+        3,
+        "--compression-level",
+        help="Compression level (1-9 for zstd/gzip, 1-11 for brotli)"
+    ),
+    use_pyarrow: bool = typer.Option(
+        True,
+        "--use-pyarrow/--no-pyarrow",
+        help="Use pyarrow backend for parquet writes (faster)"
+    ),
     log_file: Optional[Path] = typer.Option(
         None,
         "--log-file",
@@ -107,7 +122,10 @@ def step2_convert_h5ad(
     
     with start_action(action_type="cli_step2_convert_h5ad"):
         typer.echo("Step 2: Converting h5ad to parquet...")
-        convert_h5ad_to_parquet(h5ad_path, mappers_path, output_dir, chunk_size, top_genes)
+        convert_h5ad_to_parquet(
+            h5ad_path, mappers_path, output_dir, chunk_size, top_genes,
+            compression=compression, compression_level=compression_level, use_pyarrow=use_pyarrow
+        )
         typer.secho("✓ Conversion completed successfully", fg=typer.colors.GREEN)
         typer.echo(f"Output: {output_dir}")
 
@@ -206,10 +224,10 @@ def step5_upload(
         help="Directory containing train/test subdirectories"
     ),
     repo_id: str = typer.Option(
-        ...,
+        "longevity-genie/cell2sentence4longevity-data",
         "--repo-id",
         "-r",
-        help="HuggingFace repository ID (e.g., 'username/dataset-name')"
+        help="HuggingFace repository ID (e.g., 'username/dataset-name'). Defaults to 'longevity-genie/cell2sentence4longevity-data'"
     ),
     token: str = typer.Option(
         ...,
@@ -223,12 +241,6 @@ def step5_upload(
         "--readme",
         help="Path to README file"
     ),
-    max_workers: int = typer.Option(
-        8,
-        "--max-workers",
-        "-w",
-        help="Number of parallel upload threads"
-    ),
     log_file: Optional[Path] = typer.Option(
         None,
         "--log-file",
@@ -238,7 +250,7 @@ def step5_upload(
 ) -> None:
     """Step 5: Upload to HuggingFace.
     
-    Uploads the processed data to HuggingFace with parallel uploads for faster processing.
+    Uploads the processed data to HuggingFace in a single batch commit.
     """
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -247,7 +259,7 @@ def step5_upload(
     
     with start_action(action_type="cli_step5_upload"):
         typer.echo("Step 5: Uploading to HuggingFace...")
-        upload_to_huggingface(data_splits_dir, repo_id, token, readme_path, max_workers)
+        upload_to_huggingface(data_splits_dir, token, repo_id, readme_path)
         typer.secho("✓ Upload completed successfully", fg=typer.colors.GREEN)
         typer.echo(f"Dataset: https://huggingface.co/datasets/{repo_id}")
 
@@ -265,10 +277,10 @@ def run_all(
         help="Base output directory"
     ),
     repo_id: Optional[str] = typer.Option(
-        None,
+        "longevity-genie/cell2sentence4longevity-data",
         "--repo-id",
         "-r",
-        help="HuggingFace repository ID (skip step 5 if not provided)"
+        help="HuggingFace repository ID. Defaults to 'longevity-genie/cell2sentence4longevity-data'"
     ),
     token: Optional[str] = typer.Option(
         None,
@@ -287,6 +299,21 @@ def run_all(
         2000,
         "--top-genes",
         help="Number of top expressed genes per cell"
+    ),
+    compression: str = typer.Option(
+        "zstd",
+        "--compression",
+        help="Compression algorithm for parquet files. Options: uncompressed, snappy, gzip, lzo, brotli, lz4, zstd"
+    ),
+    compression_level: int = typer.Option(
+        3,
+        "--compression-level",
+        help="Compression level (1-9 for zstd/gzip, 1-11 for brotli)"
+    ),
+    use_pyarrow: bool = typer.Option(
+        True,
+        "--use-pyarrow/--no-pyarrow",
+        help="Use pyarrow backend for parquet writes (faster)"
     ),
     test_size: float = typer.Option(
         0.05,
@@ -328,7 +355,10 @@ def run_all(
         typer.echo("="*80)
         mappers_path = output_dir / "hgnc_mappers.pkl"
         parquet_dir = output_dir / "temp_parquet"
-        convert_h5ad_to_parquet(h5ad_path, mappers_path, parquet_dir, chunk_size, top_genes)
+        convert_h5ad_to_parquet(
+            h5ad_path, mappers_path, parquet_dir, chunk_size, top_genes,
+            compression=compression, compression_level=compression_level, use_pyarrow=use_pyarrow
+        )
         typer.secho("✓ Step 2 complete\n", fg=typer.colors.GREEN)
         
         # Step 3
@@ -351,11 +381,11 @@ def run_all(
             typer.echo("="*80)
             typer.echo("STEP 5: Uploading to HuggingFace")
             typer.echo("="*80)
-            upload_to_huggingface(data_splits_dir, repo_id, token, None, 8)
+            upload_to_huggingface(data_splits_dir, token, repo_id, None)
             typer.secho("✓ Step 5 complete\n", fg=typer.colors.GREEN)
             typer.echo(f"Dataset: https://huggingface.co/datasets/{repo_id}")
         else:
-            typer.echo("\n⚠ Skipping Step 5 (upload) - repo_id or token not provided")
+            typer.echo("\n⚠ Skipping Step 5 (upload) - token not provided")
         
         typer.echo("\n" + "="*80)
         typer.secho("✓ PIPELINE COMPLETE", fg=typer.colors.GREEN, bold=True)

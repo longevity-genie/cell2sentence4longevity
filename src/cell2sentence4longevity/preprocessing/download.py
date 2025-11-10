@@ -50,7 +50,6 @@ def download_dataset(
                 path=str(output_path),
                 size_mb=file_size / (1024 * 1024)
             )
-            print(f"✓ File already exists: {output_path} ({file_size / (1024 * 1024):.2f} MB)")
             return output_path
         
         action.log(message_type="starting_download", filename=filename)

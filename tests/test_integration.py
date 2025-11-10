@@ -93,9 +93,9 @@ class TestIntegrationPipeline:
         
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
         
-        with start_action(action_type="integration_test_full_pipeline"):
+        with start_action(action_type="integration_test_full_pipeline") as test_action:
             # Step 0: Download real dataset
-            print("\n=== Step 0: Downloading real dataset ===")
+            test_action.log(message_type="test_step", step=0, description="Downloading real dataset")
             url = "https://datasets.cellxgene.cziscience.com/9deda9ad-6a71-401e-b909-5263919d85f9.h5ad"
             
             h5ad_path = download_dataset(
@@ -107,18 +107,29 @@ class TestIntegrationPipeline:
             # Validate download
             assert h5ad_path.exists(), "Downloaded h5ad file should exist"
             assert h5ad_path.stat().st_size > 0, "Downloaded file should not be empty"
-            print(f"✓ Downloaded dataset: {h5ad_path} ({h5ad_path.stat().st_size / 1024 / 1024:.2f} MB)")
+            test_action.log(
+                message_type="download_validated", 
+                path=str(h5ad_path), 
+                size_mb=h5ad_path.stat().st_size / 1024 / 1024
+            )
             
-            # Step 1: Create HGNC mapper
-            print("\n=== Step 1: Creating HGNC mapper ===")
-            create_hgnc_mapper(temp_dirs['interim'])
-            
+            # Step 1: Create HGNC mapper (optional - skip if download fails)
+            test_action.log(message_type="test_step", step=1, description="Creating HGNC mapper (optional)")
             mappers_path = temp_dirs['interim'] / 'hgnc_mappers.pkl'
-            assert mappers_path.exists(), "HGNC mappers file should exist"
-            print(f"✓ Created HGNC mapper: {mappers_path}")
+            try:
+                create_hgnc_mapper(temp_dirs['interim'])
+                assert mappers_path.exists(), "HGNC mappers file should exist"
+                test_action.log(message_type="hgnc_mapper_created", path=str(mappers_path))
+            except RuntimeError as e:
+                test_action.log(
+                    message_type="hgnc_mapper_creation_failed", 
+                    error=str(e),
+                    fallback="Will use feature_name from h5ad"
+                )
+                mappers_path = None
             
             # Step 2: Convert h5ad to parquet
-            print("\n=== Step 2: Converting h5ad to parquet ===")
+            test_action.log(message_type="test_step", step=2, description="Converting h5ad to parquet")
             parquet_dir = temp_dirs['interim'] / 'parquet_chunks'
             
             convert_h5ad_to_parquet(
@@ -132,17 +143,20 @@ class TestIntegrationPipeline:
             # Validate parquet conversion
             parquet_files = list(parquet_dir.glob("chunk_*.parquet"))
             assert len(parquet_files) > 0, "Should have created parquet files"
-            print(f"✓ Created {len(parquet_files)} parquet chunks")
+            test_action.log(message_type="parquet_chunks_created", count=len(parquet_files))
             
             # Check first chunk structure
             sample_df = pl.read_parquet(parquet_files[0])
-            print(f"  Columns: {sample_df.columns}")
-            print(f"  Rows in first chunk: {len(sample_df)}")
+            test_action.log(
+                message_type="sample_chunk_structure",
+                columns=sample_df.columns,
+                rows=len(sample_df)
+            )
             assert 'cell_sentence' in sample_df.columns or 'cell2sentence' in sample_df.columns, \
                 "Should have cell_sentence or cell2sentence column"
             
             # Step 3: Add age and cleanup
-            print("\n=== Step 3: Adding age and cleaning up ===")
+            test_action.log(message_type="test_step", step=3, description="Adding age and cleaning up")
             add_age_and_cleanup(parquet_dir)
             
             # Validate age column was added
@@ -153,14 +167,14 @@ class TestIntegrationPipeline:
             age_dtype = sample_df_after_age.schema['age']
             assert age_dtype in [pl.Int64, pl.Int32, pl.Int16, pl.Float64, pl.Float32], \
                 f"Age column should be numeric, got {age_dtype}"
-            print(f"✓ Age column added with type: {age_dtype}")
+            test_action.log(message_type="age_column_validated", dtype=str(age_dtype))
             
             # Check age values are reasonable
             age_values = sample_df_after_age['age'].drop_nulls()
             if len(age_values) > 0:
                 min_age = age_values.min()
                 max_age = age_values.max()
-                print(f"  Age range: {min_age} - {max_age} years")
+                test_action.log(message_type="age_range", min_age=min_age, max_age=max_age)
                 assert min_age >= 0, "Age should be non-negative"
                 assert max_age <= 150, "Age should be realistic"
             
@@ -169,7 +183,7 @@ class TestIntegrationPipeline:
                 "Should have cell_sentence column (renamed from cell2sentence if needed)"
             
             # Step 4: Create train/test split
-            print("\n=== Step 4: Creating train/test split ===")
+            test_action.log(message_type="test_step", step=4, description="Creating train/test split")
             create_train_test_split(
                 parquet_dir=parquet_dir,
                 output_dir=temp_dirs['output'],
@@ -191,8 +205,11 @@ class TestIntegrationPipeline:
             assert len(train_files) > 0, "Should have train files"
             assert len(test_files) > 0, "Should have test files"
             
-            print(f"✓ Created train set: {len(train_files)} chunks")
-            print(f"✓ Created test set: {len(test_files)} chunks")
+            test_action.log(
+                message_type="train_test_split_created",
+                train_chunks=len(train_files),
+                test_chunks=len(test_files)
+            )
             
             # Verify train/test split ratio
             train_df = pl.scan_parquet(train_dir / "chunk_*.parquet")
@@ -203,15 +220,18 @@ class TestIntegrationPipeline:
             total_count = train_count + test_count
             
             test_ratio = test_count / total_count
-            print(f"  Train count: {train_count}")
-            print(f"  Test count: {test_count}")
-            print(f"  Test ratio: {test_ratio:.3f}")
+            test_action.log(
+                message_type="split_statistics",
+                train_count=train_count,
+                test_count=test_count,
+                test_ratio=test_ratio
+            )
             
             # Allow some tolerance in split ratio
             assert 0.03 <= test_ratio <= 0.07, f"Test ratio should be ~0.05, got {test_ratio:.3f}"
             
             # Validate final data structure
-            print("\n=== Validating final data structure ===")
+            test_action.log(message_type="test_step", description="Validating final data structure")
             final_train_sample = pl.scan_parquet(train_dir / "chunk_*.parquet").limit(100).collect()
             
             assert 'cell_sentence' in final_train_sample.columns, "Final data should have cell_sentence"
@@ -221,11 +241,14 @@ class TestIntegrationPipeline:
             non_empty_sentences = final_train_sample['cell_sentence'].str.len_chars() > 0
             assert non_empty_sentences.sum() > 0, "Should have non-empty cell sentences"
             
-            print(f"  Final columns: {final_train_sample.columns}")
-            print(f"  Sample cell_sentence: {final_train_sample['cell_sentence'][0][:100]}...")
+            test_action.log(
+                message_type="final_structure_validated",
+                columns=final_train_sample.columns,
+                sample_sentence=final_train_sample['cell_sentence'][0][:100]
+            )
             
             # Validate logs were written properly
-            print("\n=== Validating logs ===")
+            test_action.log(message_type="test_step", description="Validating logs")
             assert json_log.exists(), "JSON log file should exist"
             assert rendered_log.exists(), "Rendered log file should exist"
             
@@ -239,12 +262,12 @@ class TestIntegrationPipeline:
                 assert 'action_type' in first_log or 'message_type' in first_log, \
                     "Log entries should have action_type or message_type"
             
-            print(f"✓ JSON log has {len(log_lines)} entries")
+            test_action.log(message_type="log_validation", json_entries=len(log_lines))
             
             # Check rendered log has content
             rendered_content = rendered_log.read_text()
             assert len(rendered_content) > 0, "Rendered log should have content"
-            print(f"✓ Rendered log has {len(rendered_content)} characters")
+            test_action.log(message_type="log_validation", rendered_chars=len(rendered_content))
             
             # Validate specific log actions were recorded
             log_content = '\n'.join(log_lines)
@@ -258,7 +281,7 @@ class TestIntegrationPipeline:
             assert 'create_train_test_split' in log_content or 'split' in log_content.lower(), \
                 "Should log train/test split"
             
-            print("\n=== ✓ All integration tests passed ===")
+            test_action.log(message_type="test_complete", status="passed")
     
     def test_pipeline_with_small_chunk_size(self, temp_dirs: dict[str, Path]) -> None:
         """Test pipeline with a smaller chunk size to verify chunking works correctly."""
@@ -268,7 +291,7 @@ class TestIntegrationPipeline:
         
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
         
-        with start_action(action_type="integration_test_small_chunks"):
+        with start_action(action_type="integration_test_small_chunks") as test_action:
             # Download
             url = "https://datasets.cellxgene.cziscience.com/9deda9ad-6a71-401e-b909-5263919d85f9.h5ad"
             h5ad_path = download_dataset(
@@ -277,9 +300,13 @@ class TestIntegrationPipeline:
                 filename="test_dataset.h5ad"
             )
             
-            # Create mapper
-            create_hgnc_mapper(temp_dirs['interim'])
+            # Create mapper (optional)
             mappers_path = temp_dirs['interim'] / 'hgnc_mappers.pkl'
+            try:
+                create_hgnc_mapper(temp_dirs['interim'])
+            except RuntimeError:
+                # HGNC download failed, will use feature_name fallback
+                mappers_path = None
             
             # Convert with small chunk size
             parquet_dir = temp_dirs['interim'] / 'parquet_chunks'
@@ -304,7 +331,11 @@ class TestIntegrationPipeline:
                 assert len(df) <= small_chunk_size * 1.1, \
                     f"Chunk should be around {small_chunk_size} rows, got {len(df)}"
             
-            print(f"✓ Created {len(parquet_files)} chunks with size ~{small_chunk_size}")
+            test_action.log(
+                message_type="chunk_validation",
+                num_chunks=len(parquet_files),
+                chunk_size=small_chunk_size
+            )
             
             # Continue with rest of pipeline
             add_age_and_cleanup(parquet_dir)
@@ -324,7 +355,11 @@ class TestIntegrationPipeline:
             assert len(train_files) > 0
             assert len(test_files) > 0
             
-            print(f"✓ Small chunk test passed: {len(train_files)} train, {len(test_files)} test chunks")
+            test_action.log(
+                message_type="small_chunk_test_complete",
+                train_chunks=len(train_files),
+                test_chunks=len(test_files)
+            )
 
 
 class TestLogging:
@@ -339,8 +374,8 @@ class TestLogging:
             
             to_nice_file(output_file=json_log, rendered_file=rendered_log)
             
-            with start_action(action_type="test_log_creation"):
-                pass
+            with start_action(action_type="test_log_creation") as action:
+                action.log(message_type="test_message", status="testing")
             
             assert json_log.exists(), "JSON log should be created"
             assert rendered_log.exists(), "Rendered log should be created"
@@ -353,8 +388,6 @@ class TestLogging:
                 first_entry = json.loads(lines[0])
                 assert 'action_type' in first_entry or 'message_type' in first_entry, \
                     "Log should have structured entries"
-            
-            print("✓ Log file creation test passed")
 
 
 class TestAgeExtraction:
@@ -375,8 +408,6 @@ class TestAgeExtraction:
         assert extract_age("") is None
         assert extract_age("unknown") is None
         assert extract_age("child") is None
-        
-        print("✓ Age extraction tests passed")
     
     def test_age_field_numeric_dtype(self) -> None:
         """Test that age field has numeric dtype after processing."""
@@ -403,8 +434,6 @@ class TestAgeExtraction:
         
         # Verify all ages are numeric
         assert df['age'].dtype.is_integer(), "Age dtype should be integer"
-        
-        print("✓ Age numeric dtype tests passed")
 
 
 if __name__ == "__main__":
