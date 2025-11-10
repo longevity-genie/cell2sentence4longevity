@@ -1,7 +1,7 @@
 [project]
 name = "cell2sentence4longevity"
 version = "0.1.0"
-description = "Add your description here"
+description = "Cell to sentence preprocessing pipeline for longevity research"
 readme = "README.md"
 authors = [
     { name = "antonkulaga", email = "antonkulaga@gmail.com" }
@@ -11,10 +11,28 @@ dependencies = [
     "jupyterlab>=4.4.10",
     "polars>=1.35.2",
     "scanpy>=1.11.5",
+    "typer>=0.20.0",
+    "eliot>=1.17.5",
+    "requests>=2.32.5",
+    "pyarrow>=22.0.0",
+    "tqdm>=4.67.1",
+    "anndata>=0.12.6",
+    "numpy>=2.3.4",
+    "scikit-learn>=1.7.2",
+    "huggingface-hub>=1.1.2",
+    "pycomfort>=0.0.18",
+    "python-dotenv>=1.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-cov>=6.0.0",
 ]
 
 [project.scripts]
-cell2sentence4longevity = "cell2sentence4longevity:main"
+preprocess = "cell2sentence4longevity.preprocess:main"
+cleanup-tests = "tests.cleanup:main"
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]

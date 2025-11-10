@@ -1,0 +1,13 @@
+{"action_status":"started","timestamp":1762813965.1103926,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","action_type":"demo_enhanced_logging","task_level":[1]}
+{"parquet_dir":"demo_logging/data","action_status":"started","timestamp":1762813965.115965,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","action_type":"add_age_and_cleanup","task_level":[2,1]}
+{"count":1,"timestamp":1762813965.1165335,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,2],"message_type":"found_parquet_files"}
+{"count":1000,"timestamp":1762813965.1220958,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,3],"message_type":"total_cells_before_age_extraction"}
+{"file_count":1,"timestamp":1762813965.1224656,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,4],"message_type":"adding_age_column"}
+{"timestamp":1762813965.1309328,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,5],"message_type":"age_column_added"}
+{"timestamp":1762813965.1313183,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,6],"message_type":"column_naming_correct"}
+{"total_columns":5,"has_age":true,"has_cell_sentence":true,"timestamp":1762813965.131725,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,7],"message_type":"verification_complete"}
+{"total_cells":1000,"cells_with_valid_age":900,"cells_with_null_age":100,"valid_age_percentage":90.0,"null_age_percentage":10.0,"timestamp":1762813965.1347034,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,8],"message_type":"age_extraction_summary"}
+{"samples":[{"development_stage":"adult"},{"development_stage":"unknown"},{"development_stage":null},{"development_stage":""},{"development_stage":"pediatric"},{"development_stage":"newborn"},{"development_stage":"5-month-old"},{"development_stage":"stage 22"},{"development_stage":"twenty-year-old"},{"development_stage":"young adult"}],"timestamp":1762813965.136685,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,9],"message_type":"sample_null_age_development_stages"}
+{"distribution":[{"age":22,"count":700},{"age":25,"count":200}],"timestamp":1762813965.1393304,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","task_level":[2,10],"message_type":"age_distribution"}
+{"action_status":"succeeded","timestamp":1762813965.1397877,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","action_type":"add_age_and_cleanup","task_level":[2,11]}
+{"action_status":"succeeded","timestamp":1762813965.1403658,"task_uuid":"b23e5444-f138-4582-bf3c-65360ff407cb","action_type":"demo_enhanced_logging","task_level":[3]}

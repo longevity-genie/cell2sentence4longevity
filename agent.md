@@ -27,13 +27,10 @@ This document outlines the coding standards and practices to follow when working
 ## Data Processing
 
 - **Prefer Polars**: Prefer Polars over Pandas for data processing
-- **Be memory efficient**: use scan_parquet and lazy api. Take into account that scan_parquet can open content of whole folder instead of opening separately. Also, you can write lazyly using sink_parquet. You can also apply compression (check what sink parquet supports) when saving.
-- **Use data/input, data/interim, data/output pattern** . Input and downloaded files you store at ./data/input, intermediates and interim and final at data/output
 
 ## Logging
 
 - **Eliot logging**: Use eliot as the default logging library using the `with start_action(...) as action` pattern
-- **Use log folder**: use to_nice_file(output_file=json_path, rendered_file=log_path) from pycomfort library (for which you also check exact syntax as you may have bad intuition on it) to add file destination for logging
 
 ## CLI Development
 

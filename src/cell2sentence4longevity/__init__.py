@@ -1,2 +1,10 @@
+"""Cell to sentence preprocessing pipeline for longevity research."""
+
+from cell2sentence4longevity.cli import app
+
+__all__ = ["app"]
+
+
 def main() -> None:
-    print("Hello from cell2sentence4longevity!")
+    """Entry point for the CLI."""
+    app()

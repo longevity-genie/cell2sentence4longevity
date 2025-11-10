@@ -1,0 +1,467 @@
+"""Preprocessing command-line interface for cell2sentence pipeline."""
+
+from pathlib import Path
+from typing import Optional
+
+import typer
+from eliot import start_action
+from pycomfort.logging import to_nice_file
+from dotenv import load_dotenv
+
+from cell2sentence4longevity.preprocessing import (
+    create_hgnc_mapper,
+    convert_h5ad_to_parquet,
+    add_age_and_cleanup,
+    create_train_test_split,
+    upload_to_huggingface,
+    download_dataset,
+)
+
+# Load environment variables from .env file
+load_dotenv()
+
+app = typer.Typer(
+    name="preprocess",
+    help="Cell to sentence preprocessing pipeline for longevity research",
+    add_completion=False,
+)
+
+
+@app.command()
+def download(
+    url: str = typer.Option(
+        "https://datasets.cellxgene.cziscience.com/9deda9ad-6a71-401e-b909-5263919d85f9.h5ad",
+        "--url",
+        "-u",
+        help="URL to download dataset from"
+    ),
+    input_dir: Path = typer.Option(
+        Path("./data/input"),
+        "--input-dir",
+        "-i",
+        help="Directory to save downloaded files"
+    ),
+    filename: str | None = typer.Option(
+        None,
+        "--filename",
+        "-f",
+        help="Optional filename. If not provided, extracted from URL"
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Force re-download even if file exists"
+    ),
+    log_file: Path | None = typer.Option(
+        None,
+        "--log-file",
+        "-l",
+        help="Path to eliot log file"
+    ),
+) -> None:
+    """Download dataset from a URL.
+    
+    Downloads datasets (typically h5ad files) to the input directory.
+    By default, skips download if file already exists. Use --force to re-download.
+    """
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        json_path = log_file.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=log_file)
+    
+    with start_action(action_type="cli_download"):
+        if force:
+            typer.echo(f"Force downloading dataset from {url}...")
+        else:
+            typer.echo(f"Downloading dataset from {url} (skipping if already exists)...")
+        output_path = download_dataset(url, input_dir, filename, force=force)
+        typer.secho("✓ Download completed successfully", fg=typer.colors.GREEN)
+        typer.echo(f"Saved to: {output_path}")
+
+
+@app.command()
+def step1_hgnc_mapper(
+    interim_dir: Path = typer.Option(
+        Path("./data/interim"),
+        "--interim-dir",
+        "-i",
+        help="Directory to save interim files (HGNC mappers)"
+    ),
+    log_file: Optional[Path] = typer.Option(
+        None,
+        "--log-file",
+        "-l",
+        help="Path to eliot log file"
+    ),
+) -> None:
+    """Step 1: Create HGNC gene mapper.
+    
+    Downloads official gene mappings from HGNC to convert Ensembl IDs to gene symbols.
+    """
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        json_path = log_file.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=log_file)
+    
+    with start_action(action_type="cli_step1_hgnc_mapper"):
+        typer.echo("Step 1: Creating HGNC mapper...")
+        create_hgnc_mapper(interim_dir)
+        typer.secho("✓ HGNC mapper created successfully", fg=typer.colors.GREEN)
+        typer.echo(f"Output: {interim_dir / 'hgnc_mappers.pkl'}")
+
+
+@app.command()
+def step2_convert_h5ad(
+    h5ad_path: Path | None = typer.Argument(
+        None,
+        help="Path to AIDA h5ad file (optional, auto-detects from --input-dir if not provided)"
+    ),
+    input_dir: Path = typer.Option(
+        Path("./data/input"),
+        "--input-dir",
+        help="Directory containing input h5ad files (auto-detects if h5ad_path not provided)"
+    ),
+    mappers_path: Path = typer.Option(
+        Path("./data/interim/hgnc_mappers.pkl"),
+        "--mappers",
+        "-m",
+        help="Path to HGNC mappers pickle file"
+    ),
+    interim_dir: Path = typer.Option(
+        Path("./data/interim/parquet_chunks"),
+        "--interim-dir",
+        "-i",
+        help="Directory to save interim parquet chunks"
+    ),
+    chunk_size: int = typer.Option(
+        10000,
+        "--chunk-size",
+        "-c",
+        help="Number of cells per chunk"
+    ),
+    top_genes: int = typer.Option(
+        2000,
+        "--top-genes",
+        "-t",
+        help="Number of top expressed genes per cell"
+    ),
+    log_file: Optional[Path] = typer.Option(
+        None,
+        "--log-file",
+        "-l",
+        help="Path to eliot log file"
+    ),
+) -> None:
+    """Step 2: Convert h5ad to parquet with cell sentences.
+    
+    Transforms the AIDA h5ad file into parquet chunks, creating "cell sentences" -
+    space-separated gene symbols ordered by expression level.
+    """
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        json_path = log_file.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=log_file)
+    
+    with start_action(action_type="cli_step2_convert_h5ad"):
+        # Auto-detect h5ad file if not provided
+        if h5ad_path is None or not h5ad_path.exists():
+            h5ad_files = list(input_dir.glob("*.h5ad"))
+            if h5ad_files:
+                h5ad_path = h5ad_files[0]
+                typer.echo(f"Auto-detected h5ad file: {h5ad_path}")
+            else:
+                typer.echo(f"Error: Could not find h5ad file. Searched in {input_dir}")
+                typer.echo("Please provide h5ad_path or download a dataset first using 'preprocess download'")
+                raise typer.Exit(1)
+        
+        typer.echo("Step 2: Converting h5ad to parquet...")
+        convert_h5ad_to_parquet(h5ad_path, mappers_path, interim_dir, chunk_size, top_genes)
+        typer.secho("✓ Conversion completed successfully", fg=typer.colors.GREEN)
+        typer.echo(f"Output: {interim_dir}")
+
+
+@app.command()
+def step3_add_age(
+    interim_dir: Path = typer.Option(
+        Path("./data/interim/parquet_chunks"),
+        "--interim-dir",
+        "-i",
+        help="Directory containing interim parquet chunks"
+    ),
+    log_file: Optional[Path] = typer.Option(
+        None,
+        "--log-file",
+        "-l",
+        help="Path to eliot log file"
+    ),
+) -> None:
+    """Step 3: Add age column and cleanup.
+    
+    Extracts age as integer from development_stage field and ensures proper column naming.
+    """
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        json_path = log_file.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=log_file)
+    
+    with start_action(action_type="cli_step3_add_age"):
+        typer.echo("Step 3: Adding age and cleaning up...")
+        add_age_and_cleanup(interim_dir)
+        typer.secho("✓ Age added and cleanup completed", fg=typer.colors.GREEN)
+
+
+@app.command()
+def step4_train_test_split(
+    interim_dir: Path = typer.Option(
+        Path("./data/interim/parquet_chunks"),
+        "--interim-dir",
+        "-i",
+        help="Directory containing interim parquet chunks"
+    ),
+    output_dir: Path = typer.Option(
+        Path("./data/output"),
+        "--output-dir",
+        "-o",
+        help="Directory to save final train/test splits"
+    ),
+    test_size: float = typer.Option(
+        0.05,
+        "--test-size",
+        "-t",
+        help="Proportion of data for test set"
+    ),
+    random_state: int = typer.Option(
+        42,
+        "--random-state",
+        "-r",
+        help="Random seed for reproducibility"
+    ),
+    chunk_size: int = typer.Option(
+        10000,
+        "--chunk-size",
+        "-c",
+        help="Number of cells per output chunk"
+    ),
+    log_file: Optional[Path] = typer.Option(
+        None,
+        "--log-file",
+        "-l",
+        help="Path to eliot log file"
+    ),
+) -> None:
+    """Step 4: Create stratified train/test split.
+    
+    Creates a train/test split stratified by age to maintain age distribution in both sets.
+    """
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        json_path = log_file.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=log_file)
+    
+    with start_action(action_type="cli_step4_train_test_split"):
+        typer.echo("Step 4: Creating train/test split...")
+        create_train_test_split(interim_dir, output_dir, test_size, random_state, chunk_size)
+        typer.secho("✓ Train/test split created successfully", fg=typer.colors.GREEN)
+        typer.echo(f"Output: {output_dir}")
+
+
+@app.command()
+def step5_upload(
+    output_dir: Path = typer.Option(
+        Path("./data/output"),
+        "--output-dir",
+        "-o",
+        help="Directory containing train/test subdirectories"
+    ),
+    repo_id: str = typer.Option(
+        ...,
+        "--repo-id",
+        "-r",
+        help="HuggingFace repository ID (e.g., 'username/dataset-name')"
+    ),
+    token: str = typer.Option(
+        ...,
+        "--token",
+        "-t",
+        help="HuggingFace API token",
+        envvar="HF_TOKEN"
+    ),
+    readme_path: Optional[Path] = typer.Option(
+        None,
+        "--readme",
+        help="Path to README file"
+    ),
+    max_workers: int = typer.Option(
+        8,
+        "--max-workers",
+        "-w",
+        help="Number of parallel upload threads"
+    ),
+    log_file: Optional[Path] = typer.Option(
+        None,
+        "--log-file",
+        "-l",
+        help="Path to eliot log file"
+    ),
+) -> None:
+    """Step 5: Upload to HuggingFace.
+    
+    Uploads the processed data to HuggingFace with parallel uploads for faster processing.
+    """
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        json_path = log_file.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=log_file)
+    
+    with start_action(action_type="cli_step5_upload"):
+        typer.echo("Step 5: Uploading to HuggingFace...")
+        upload_to_huggingface(output_dir, repo_id, token, readme_path, max_workers)
+        typer.secho("✓ Upload completed successfully", fg=typer.colors.GREEN)
+        typer.echo(f"Dataset: https://huggingface.co/datasets/{repo_id}")
+
+
+@app.command()
+def run_all(
+    h5ad_path: Path | None = typer.Argument(
+        None,
+        help="Path to AIDA h5ad file (optional, auto-detects from data/input if not provided)"
+    ),
+    input_dir: Path = typer.Option(
+        Path("./data/input"),
+        "--input-dir",
+        help="Directory containing input files"
+    ),
+    interim_dir: Path = typer.Option(
+        Path("./data/interim"),
+        "--interim-dir",
+        help="Directory for interim files"
+    ),
+    output_dir: Path = typer.Option(
+        Path("./data/output"),
+        "--output-dir",
+        "-o",
+        help="Directory for final output files"
+    ),
+    repo_id: Optional[str] = typer.Option(
+        None,
+        "--repo-id",
+        "-r",
+        help="HuggingFace repository ID (skip step 5 if not provided)"
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="HuggingFace API token (skip step 5 if not provided)",
+        envvar="HF_TOKEN"
+    ),
+    chunk_size: int = typer.Option(
+        10000,
+        "--chunk-size",
+        "-c",
+        help="Number of cells per chunk"
+    ),
+    top_genes: int = typer.Option(
+        2000,
+        "--top-genes",
+        help="Number of top expressed genes per cell"
+    ),
+    test_size: float = typer.Option(
+        0.05,
+        "--test-size",
+        help="Proportion of data for test set"
+    ),
+    log_file: Optional[Path] = typer.Option(
+        Path("./logs/pipeline.log"),
+        "--log-file",
+        "-l",
+        help="Path to eliot log file"
+    ),
+) -> None:
+    """Run all pipeline steps sequentially.
+    
+    This command runs all preprocessing steps in order:
+    1. Create HGNC mapper
+    2. Convert h5ad to parquet
+    3. Add age and cleanup
+    4. Create train/test split
+    5. Upload to HuggingFace (if repo_id and token provided)
+    """
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        json_path = log_file.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=log_file)
+    
+    with start_action(action_type="cli_run_all"):
+        # Auto-detect h5ad file if not provided
+        if h5ad_path is None or not h5ad_path.exists():
+            h5ad_files = list(input_dir.glob("*.h5ad"))
+            if h5ad_files:
+                h5ad_path = h5ad_files[0]
+                typer.echo(f"Auto-detected h5ad file: {h5ad_path}")
+            else:
+                typer.echo(f"Error: Could not find h5ad file. Searched in {input_dir}")
+                typer.echo("Please provide h5ad_path or download a dataset first using 'preprocess download'")
+                raise typer.Exit(1)
+        
+        # Step 1
+        typer.echo("\n" + "="*80)
+        typer.echo("STEP 1: Creating HGNC mapper")
+        typer.echo("="*80)
+        create_hgnc_mapper(interim_dir)
+        typer.secho("✓ Step 1 complete\n", fg=typer.colors.GREEN)
+        
+        # Step 2
+        typer.echo("="*80)
+        typer.echo("STEP 2: Converting h5ad to parquet")
+        typer.echo("="*80)
+        mappers_path = interim_dir / "hgnc_mappers.pkl"
+        parquet_dir = interim_dir / "parquet_chunks"
+        convert_h5ad_to_parquet(h5ad_path, mappers_path, parquet_dir, chunk_size, top_genes)
+        typer.secho("✓ Step 2 complete\n", fg=typer.colors.GREEN)
+        
+        # Step 3
+        typer.echo("="*80)
+        typer.echo("STEP 3: Adding age and cleaning up")
+        typer.echo("="*80)
+        add_age_and_cleanup(parquet_dir)
+        typer.secho("✓ Step 3 complete\n", fg=typer.colors.GREEN)
+        
+        # Step 4
+        typer.echo("="*80)
+        typer.echo("STEP 4: Creating train/test split")
+        typer.echo("="*80)
+        create_train_test_split(parquet_dir, output_dir, test_size, 42, chunk_size)
+        typer.secho("✓ Step 4 complete\n", fg=typer.colors.GREEN)
+        
+        # Step 5 (optional)
+        if repo_id and token:
+            typer.echo("="*80)
+            typer.echo("STEP 5: Uploading to HuggingFace")
+            typer.echo("="*80)
+            upload_to_huggingface(output_dir, repo_id, token, None, 8)
+            typer.secho("✓ Step 5 complete\n", fg=typer.colors.GREEN)
+            typer.echo(f"Dataset: https://huggingface.co/datasets/{repo_id}")
+        else:
+            typer.echo("\n⚠ Skipping Step 5 (upload) - repo_id or token not provided")
+        
+        typer.echo("\n" + "="*80)
+        typer.secho("✓ PIPELINE COMPLETE", fg=typer.colors.GREEN, bold=True)
+        typer.echo("="*80)
+        typer.echo(f"Input directory: {input_dir}")
+        typer.echo(f"Interim directory: {interim_dir}")
+        typer.echo(f"Output directory: {output_dir}")
+
+
+def main() -> None:
+    """Main entrypoint that shows help by default."""
+    import sys
+    # If no arguments provided, show help
+    if len(sys.argv) == 1:
+        sys.argv.append("--help")
+    app()
+
+
+if __name__ == "__main__":
+    main()
+
