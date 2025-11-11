@@ -22,17 +22,18 @@ dependencies = [
     "huggingface-hub>=1.1.2",
     "pycomfort>=0.0.18",
     "python-dotenv>=1.2.1",
+    "cellxgene-census>=1.17.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3.4",
     "pytest-cov>=6.0.0",
+    "psutil>=6.2.0",
 ]
 
 [project.scripts]
 preprocess = "cell2sentence4longevity.preprocess:main"
-cleanup-tests = "cell2sentence4longevity.cleanup:main"
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]

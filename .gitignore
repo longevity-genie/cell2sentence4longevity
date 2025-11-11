@@ -213,6 +213,7 @@ data/output/*
 !data/input/.gitkeep
 !data/interim/.gitkeep
 !data/output/.gitkeep
+# data/shared is NOT ignored - contains shared cache files
 
 # Log directories  
 logs/*

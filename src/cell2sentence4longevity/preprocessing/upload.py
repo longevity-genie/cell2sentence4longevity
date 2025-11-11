@@ -49,8 +49,9 @@ def upload_to_huggingface(
                     break
         elif (data_splits_dir / "train" / "chunk_0000.parquet").exists():
             # Old structure with splits: data_splits_dir/train/ and data_splits_dir/test/
+            # data_splits_dir is the dataset directory itself
             has_train_test_split = True
-            dataset_name = "dataset"
+            dataset_name = data_splits_dir.name
         elif (data_splits_dir / "chunks" / "chunk_0000.parquet").exists():
             # New structure without splits: dataset_name/chunks/
             has_train_test_split = False
@@ -106,6 +107,12 @@ def upload_to_huggingface(
         train_chunks_dir = None
         test_chunks_dir = None
     
+    # Validate dataset_name is not the hardcoded fallback
+    if dataset_name == "dataset" and (data_splits_dir / "train").exists():
+        # This should have been caught above, but if we still have "dataset", 
+        # use the directory name as fallback
+        dataset_name = data_splits_dir.name
+    
     with start_action(
         action_type="upload_to_huggingface",
         repo_id=repo_id,
@@ -157,7 +164,7 @@ def upload_to_huggingface(
             train_files = sorted(list(train_chunks_dir.glob("chunk_*.parquet"))) if train_chunks_dir.exists() else []
             train_to_upload = []
             for filepath in train_files:
-                repo_path = f'data/{dataset_name}/train/chunks/{filepath.name}'
+                repo_path = f'{dataset_name}/train/{filepath.name}'
                 if repo_path not in existing_files:
                     train_to_upload.append(filepath)
                     operations.append(
@@ -178,7 +185,7 @@ def upload_to_huggingface(
             test_files = sorted(list(test_chunks_dir.glob("chunk_*.parquet"))) if test_chunks_dir.exists() else []
             test_to_upload = []
             for filepath in test_files:
-                repo_path = f'data/{dataset_name}/test/chunks/{filepath.name}'
+                repo_path = f'{dataset_name}/test/{filepath.name}'
                 if repo_path not in existing_files:
                     test_to_upload.append(filepath)
                     operations.append(
@@ -201,7 +208,7 @@ def upload_to_huggingface(
             single_files = sorted(list(single_chunks_dir.glob("chunk_*.parquet"))) if single_chunks_dir.exists() else []
             files_to_upload = []
             for filepath in single_files:
-                repo_path = f'data/{dataset_name}/chunks/{filepath.name}'
+                repo_path = f'{dataset_name}/{filepath.name}'
                 if repo_path not in existing_files:
                     files_to_upload.append(filepath)
                     operations.append(
@@ -224,10 +231,13 @@ def upload_to_huggingface(
         if len(operations) == 0:
             action.log(message_type="no_files_to_upload")
         else:
+            # Log the paths that will be used in the repo
+            repo_paths = [op.path_in_repo for op in operations]
             action.log(
                 message_type="starting_batch_upload", 
                 total_operations=len(operations),
-                total_files=total_files
+                total_files=total_files,
+                repo_paths=repo_paths[:10]  # Log first 10 paths as sample
             )
             
             # Create a single commit with all operations
@@ -236,13 +246,15 @@ def upload_to_huggingface(
                     repo_id=repo_id,
                     repo_type='dataset',
                     operations=operations,
-                    commit_message=f'Upload {total_files} data files'
+                    commit_message=f'Upload {total_files} data files for {dataset_name}'
                 )
                 pbar.update(1)
             
             action.log(
                 message_type="upload_complete",
                 commit_url=commit_info.commit_url,
-                total_operations=len(operations)
+                total_operations=len(operations),
+                repo_id=repo_id,
+                dataset_name=dataset_name
             )
 

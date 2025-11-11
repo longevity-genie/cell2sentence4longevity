@@ -1,6 +1,6 @@
 """Cell to sentence preprocessing pipeline for longevity research."""
 
-from cell2sentence4longevity.cli import app
+from cell2sentence4longevity.preprocess import app
 
 __all__ = ["app"]
 

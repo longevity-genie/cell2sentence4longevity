@@ -1,7 +1,7 @@
 """H5AD to Parquet converter with cell sentence generation."""
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pickle
 import time
 import tempfile
@@ -224,6 +224,10 @@ def map_genes_to_symbols_polars(
             pl.col('ensembl_gene_id').is_not_null() & pl.col('symbol').is_not_null()
         )
         
+        # Deduplicate hgnc_mapping to avoid creating duplicate rows in join
+        # If multiple symbols exist for same ensembl_gene_id, keep the first one
+        hgnc_mapping = hgnc_mapping.unique(subset=['ensembl_gene_id'], keep='first')
+        
         # Left join to keep all genes
         mapped_df = genes_df.join(hgnc_mapping, on='ensembl_gene_id', how='left')
         
@@ -250,8 +254,25 @@ def map_genes_to_symbols_polars(
         # Sort by original index to maintain order
         mapped_df = mapped_df.sort('original_index')
         
+        # Ensure we have exactly one row per original_index (deduplicate if join created duplicates)
+        if mapped_df.height != n_genes:
+            action.log(
+                message_type="warning_duplicate_rows_after_join",
+                mapped_df_height=mapped_df.height,
+                expected_height=n_genes,
+                note="Deduplicating by original_index, keeping first occurrence"
+            )
+            mapped_df = mapped_df.unique(subset=['original_index'], keep='first')
+        
         # Extract gene symbols list
         gene_symbols = mapped_df['final_symbol'].to_list()
+        
+        # Final validation: ensure we have the correct number of genes
+        if len(gene_symbols) != n_genes:
+            raise ValueError(
+                f"Gene mapping length mismatch: expected {n_genes} genes, "
+                f"got {len(gene_symbols)} symbols. This indicates a bug in the mapping logic."
+            )
         
         # Calculate statistics
         mapped_count = mapped_df.filter(pl.col('symbol').is_not_null()).height
@@ -409,39 +430,17 @@ def convert_h5ad_to_parquet(
         use_hgnc = True
         action.log(message_type="loading_hgnc_data_as_dataframe")
         try:
-            # Check if we have a cached TSV file
-            hgnc_dir = output_dir.parent / "hgnc_mappers"
-            hgnc_dir.mkdir(parents=True, exist_ok=True)
-            hgnc_tsv = hgnc_dir / "hgnc_complete_set.tsv"
-            
-            if hgnc_tsv.exists():
-                # Load from cached TSV
-                action.log(message_type="loading_hgnc_from_cache", path=str(hgnc_tsv))
-                schema_overrides = {
-                    'omim_id': pl.String,
-                    'ena': pl.String,
-                    'refseq_accession': pl.String,
-                    'ccds_id': pl.String,
-                    'uniprot_ids': pl.String,
-                    'pubmed_id': pl.String,
-                    'mgd_id': pl.String,
-                    'rgd_id': pl.String
-                }
-                hgnc_df = pl.read_csv(hgnc_tsv, separator='\t', schema_overrides=schema_overrides, infer_schema_length=10000)
-                action.log(message_type="hgnc_loaded_from_cache", gene_count=len(hgnc_df))
+            # Load HGNC data from shared directory (parquet format)
+            from cell2sentence4longevity.preprocessing.hgnc_mapper import get_hgnc_data
+            shared_dir = Path("./data/shared")
+            hgnc_df = get_hgnc_data(shared_dir)
+            if hgnc_df is not None:
+                action.log(message_type="hgnc_loaded_from_shared", gene_count=len(hgnc_df))
                 use_hgnc = True
             else:
-                # Download and create HGNC data
-                from cell2sentence4longevity.preprocessing.hgnc_mapper import download_hgnc_data
-                action.log(message_type="downloading_hgnc_data")
-                hgnc_df = download_hgnc_data(hgnc_dir)
-                if hgnc_df is not None:
-                    action.log(message_type="hgnc_downloaded", gene_count=len(hgnc_df))
-                    use_hgnc = True
-                else:
-                    action.log(message_type="hgnc_download_failed",
-                              fallback="Will use var_names or feature_name from h5ad")
-                    use_hgnc = False
+                action.log(message_type="hgnc_download_failed",
+                          fallback="Will use var_names or feature_name from h5ad")
+                use_hgnc = False
         except Exception as e:
             action.log(message_type="hgnc_loading_failed", error=str(e),
                       fallback="Will use var_names or feature_name from h5ad")
@@ -648,7 +647,8 @@ def convert_h5ad_to_train_test(
     compression_level: int = 3,
     use_pyarrow: bool = True,
     skip_train_test_split: bool = False,
-    stratify_by_age: bool = True
+    stratify_by_age: bool = True,
+    join_collection: bool = True
 ) -> None:
     """Convert h5ad file directly to train/test parquet splits in one streaming pass.
     
@@ -656,10 +656,17 @@ def convert_h5ad_to_train_test(
     1. Reads h5ad chunks
     2. Creates cell sentences
     3. Extracts age from development_stage
-    4. Assigns cells to train/test split (stratified by age using pure Polars)
-    5. Writes directly to train/test output directories
+    4. Adds dataset_id column for joining with collection metadata (if applicable)
+    5. Assigns cells to train/test split (stratified by age using pure Polars)
+    6. Writes directly to train/test output directories
     
     No interim files, no pandas/sklearn conversion - pure Polars for memory efficiency.
+    
+    Collection joining behavior:
+    - By default (join_collection=True), auto-detects if dataset is from CellxGene (by UUID pattern or URL)
+    - If detected, checks if dataset_id exists in collections cache
+    - Only adds dataset_id column if dataset is found in collections
+    - If join_collection=False, skips collection joining entirely
     
     Args:
         h5ad_path: Path to the h5ad file
@@ -675,6 +682,7 @@ def convert_h5ad_to_train_test(
         use_pyarrow: Use pyarrow backend for parquet writes
         skip_train_test_split: If True, writes all data to output_dir without splitting
         stratify_by_age: If True, maintains age distribution in train/test splits (default: True)
+        join_collection: If True (default), auto-detects cellxgene datasets and adds dataset_id column if found in collections. If False, skips collection joining.
     """
     start_time = time.time()
     
@@ -691,7 +699,8 @@ def convert_h5ad_to_train_test(
         top_genes=top_genes,
         test_size=test_size,
         skip_train_test_split=skip_train_test_split,
-        stratify_by_age=stratify_by_age
+        stratify_by_age=stratify_by_age,
+        join_collection=join_collection
     ) as action:
         action.log(message_type="processing_started", h5ad_file=str(h5ad_path))
         
@@ -721,39 +730,17 @@ def convert_h5ad_to_train_test(
         use_hgnc = True
         action.log(message_type="loading_hgnc_data_as_dataframe")
         try:
-            # Check if we have a cached TSV file
-            hgnc_dir = output_dir.parent / "hgnc_mappers"
-            hgnc_dir.mkdir(parents=True, exist_ok=True)
-            hgnc_tsv = hgnc_dir / "hgnc_complete_set.tsv"
-            
-            if hgnc_tsv.exists():
-                # Load from cached TSV
-                action.log(message_type="loading_hgnc_from_cache", path=str(hgnc_tsv))
-                schema_overrides = {
-                    'omim_id': pl.String,
-                    'ena': pl.String,
-                    'refseq_accession': pl.String,
-                    'ccds_id': pl.String,
-                    'uniprot_ids': pl.String,
-                    'pubmed_id': pl.String,
-                    'mgd_id': pl.String,
-                    'rgd_id': pl.String
-                }
-                hgnc_df = pl.read_csv(hgnc_tsv, separator='\t', schema_overrides=schema_overrides, infer_schema_length=10000)
-                action.log(message_type="hgnc_loaded_from_cache", gene_count=len(hgnc_df))
+            # Load HGNC data from shared directory (parquet format)
+            from cell2sentence4longevity.preprocessing.hgnc_mapper import get_hgnc_data
+            shared_dir = Path("./data/shared")
+            hgnc_df = get_hgnc_data(shared_dir)
+            if hgnc_df is not None:
+                action.log(message_type="hgnc_loaded_from_shared", gene_count=len(hgnc_df))
                 use_hgnc = True
             else:
-                # Download and create HGNC data
-                from cell2sentence4longevity.preprocessing.hgnc_mapper import download_hgnc_data
-                action.log(message_type="downloading_hgnc_data")
-                hgnc_df = download_hgnc_data(hgnc_dir)
-                if hgnc_df is not None:
-                    action.log(message_type="hgnc_downloaded", gene_count=len(hgnc_df))
-                    use_hgnc = True
-                else:
-                    action.log(message_type="hgnc_download_failed",
-                              fallback="Will use var_names or feature_name from h5ad")
-                    use_hgnc = False
+                action.log(message_type="hgnc_download_failed",
+                          fallback="Will use var_names or feature_name from h5ad")
+                use_hgnc = False
         except Exception as e:
             action.log(message_type="hgnc_loading_failed", error=str(e),
                       fallback="Will use var_names or feature_name from h5ad")
@@ -766,21 +753,69 @@ def convert_h5ad_to_train_test(
         # Create output directory structure
         if skip_train_test_split:
             # Single output directory
-            output_chunks_dir = output_dir / dataset_name / "chunks"
+            output_chunks_dir = output_dir / dataset_name
+            dir_existed = output_chunks_dir.exists()
             output_chunks_dir.mkdir(parents=True, exist_ok=True)
-            action.log(message_type="output_directory_created", 
+            action.log(message_type="output_directory_created" if not dir_existed else "output_directory_exists", 
                       output_dir=str(output_chunks_dir),
-                      mode="single_directory")
+                      mode="single_directory",
+                      created=not dir_existed)
         else:
             # Train/test split directories
-            train_dir = output_dir / dataset_name / "train" / "chunks"
-            test_dir = output_dir / dataset_name / "test" / "chunks"
+            train_dir = output_dir / dataset_name / "train"
+            test_dir = output_dir / dataset_name / "test"
+            train_existed = train_dir.exists()
+            test_existed = test_dir.exists()
             train_dir.mkdir(parents=True, exist_ok=True)
             test_dir.mkdir(parents=True, exist_ok=True)
-            action.log(message_type="output_directories_created",
+            action.log(message_type="output_directories_created" if (not train_existed or not test_existed) else "output_directories_exist",
                       train_dir=str(train_dir),
                       test_dir=str(test_dir),
-                      mode="train_test_split")
+                      mode="train_test_split",
+                      train_created=not train_existed,
+                      test_created=not test_existed)
+        
+        # Determine if we should add dataset_id column and join with collections
+        # By default (join_collection=True), auto-detect cellxgene datasets and check if they exist in collections
+        # If join_collection=False, skip joining entirely
+        should_add_dataset_id = False
+        should_join_collections = False
+        dataset_id = None
+        
+        if join_collection:
+            # Auto-detect: check if it's a cellxgene dataset and if it exists in collections
+            from cell2sentence4longevity.preprocessing.publication_lookup import (
+                is_cellxgene_dataset,
+                extract_dataset_id_from_path,
+                dataset_id_exists_in_collections,
+                join_with_collections
+            )
+            if is_cellxgene_dataset(h5ad_path):
+                dataset_id = extract_dataset_id_from_path(h5ad_path)
+                if dataset_id_exists_in_collections(dataset_id, cache_dir=None):
+                    should_add_dataset_id = True
+                    should_join_collections = True
+                    action.log(
+                        message_type="auto_detected_cellxgene_dataset",
+                        dataset_id=dataset_id,
+                        note="Auto-detected cellxgene dataset found in collections, will add dataset_id column and join with collections"
+                    )
+                else:
+                    action.log(
+                        message_type="cellxgene_dataset_not_in_collections",
+                        dataset_id=dataset_id,
+                        note="Auto-detected cellxgene dataset but not found in collections, skipping dataset_id column"
+                    )
+            else:
+                action.log(
+                    message_type="not_cellxgene_dataset",
+                    note="Dataset does not appear to be from cellxgene, skipping dataset_id column"
+                )
+        else:
+            action.log(
+                message_type="join_collection_disabled",
+                note="join_collection=False, skipping collection joining"
+            )
         
         # Get column names from obs once (outside loop)
         obs_columns = list(adata.obs.columns)
@@ -846,6 +881,16 @@ def convert_h5ad_to_train_test(
                 
                 # Extract age using vectorized Polars regex (much faster than map_elements)
                 chunk_df = extract_age_column(chunk_df)
+                
+                # Add dataset_id column if we determined it should be added
+                if should_add_dataset_id and dataset_id is not None:
+                    chunk_df = chunk_df.with_columns([
+                        pl.lit(dataset_id).alias("dataset_id")
+                    ])
+                
+                # Join with collections to add publication metadata
+                if should_join_collections:
+                    chunk_df = join_with_collections(chunk_df, cache_dir=None)
                 
                 if 'development_stage' not in chunk_df.columns:
                     chunk_action.log(message_type="warning_no_development_stage",

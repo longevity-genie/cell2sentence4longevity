@@ -8,6 +8,13 @@ from cell2sentence4longevity.preprocessing.h5ad_converter import (
 from cell2sentence4longevity.preprocessing.train_test_split import create_train_test_split
 from cell2sentence4longevity.preprocessing.upload import upload_to_huggingface
 from cell2sentence4longevity.preprocessing.download import download_dataset
+from cell2sentence4longevity.preprocessing.publication_lookup import (
+    extract_dataset_id_from_path,
+    join_with_collections,
+    get_collections_cache,
+    is_cellxgene_dataset,
+    dataset_id_exists_in_collections,
+)
 
 __all__ = [
     "create_hgnc_mapper",
@@ -16,5 +23,10 @@ __all__ = [
     "create_train_test_split",
     "upload_to_huggingface",
     "download_dataset",
+    "extract_dataset_id_from_path",
+    "join_with_collections",
+    "get_collections_cache",
+    "is_cellxgene_dataset",
+    "dataset_id_exists_in_collections",
 ]
 

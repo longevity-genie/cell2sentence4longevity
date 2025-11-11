@@ -71,8 +71,13 @@ data/
 
 ### 6. **HuggingFace Upload (Optional)**
 - Upload after each successful file processing
-- Dataset name appended to repo_id for multiple files
-- Example: `username/repo-dataset1_name`, `username/repo-dataset2_name`
+- All datasets uploaded to the same repository as subfolders
+- Each dataset becomes a subfolder: `{dataset_name}/train/` and `{dataset_name}/test/`
+- Example: Single repo `username/my-datasets` contains:
+  - `dataset1_name/train/chunk_*.parquet`
+  - `dataset1_name/test/chunk_*.parquet`
+  - `dataset2_name/train/chunk_*.parquet`
+  - `dataset2_name/test/chunk_*.parquet`
 
 ## Usage Examples
 
@@ -105,16 +110,18 @@ uv run preprocess run-all --batch-mode \
 
 ### With HuggingFace Upload
 ```bash
-# Upload each processed dataset
+# Upload each processed dataset to a single repository as subfolders
 uv run preprocess run-all --batch-mode \
   --input-dir data/input \
   --repo-id username/my-datasets \
   --token $HF_TOKEN
 
-# Results in:
-# - username/my-datasets-dataset1
-# - username/my-datasets-dataset2
-# - ...
+# Results in single repository: username/my-datasets
+# With subfolders:
+# - dataset1_name/train/chunk_*.parquet
+# - dataset1_name/test/chunk_*.parquet
+# - dataset2_name/train/chunk_*.parquet
+# - dataset2_name/test/chunk_*.parquet
 ```
 
 ### Step-by-Step Mode (Legacy, Two-Step Approach)
