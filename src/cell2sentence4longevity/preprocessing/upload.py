@@ -68,27 +68,38 @@ def upload_to_huggingface(
             has_train_test_split = (data_splits_dir / "train").exists()
     else:
         # Dataset name provided, detect if it has splits
+        # When dataset_name is provided, data_splits_dir is typically already the dataset directory
+        # Check if train/test directories exist directly in data_splits_dir
         has_train_test_split = (
-            (data_splits_dir / dataset_name / "train" / "chunks").exists() or
             (data_splits_dir / "train" / "chunks").exists() or
-            (data_splits_dir / "train").exists()
+            (data_splits_dir / "train").exists() or
+            (data_splits_dir.parent / dataset_name / "train" / "chunks").exists() or
+            (data_splits_dir.parent / dataset_name / "train").exists()
         )
     
     # Determine chunk directories based on split status
     if has_train_test_split:
         # Determine train and test chunk directories
-        if (data_splits_dir / dataset_name / "train" / "chunks" / "chunk_0000.parquet").exists():
-            # New structure: data_splits_dir/dataset_name/train/chunks/
-            train_chunks_dir = data_splits_dir / dataset_name / "train" / "chunks"
-            test_chunks_dir = data_splits_dir / dataset_name / "test" / "chunks"
-        elif (data_splits_dir / "train" / "chunks" / "chunk_0000.parquet").exists():
-            # New structure: data_splits_dir is dataset_name, train/chunks/ and test/chunks/
-            train_chunks_dir = data_splits_dir / "train" / "chunks"
-            test_chunks_dir = data_splits_dir / "test" / "chunks"
-        elif (data_splits_dir / "train" / "chunk_0000.parquet").exists():
-            # Old structure: data_splits_dir/train/ and data_splits_dir/test/
+        # When dataset_name is provided, data_splits_dir is typically the dataset directory itself
+        # Check in order of most likely structure first
+        
+        # First check: files directly in train/ and test/ (most common case)
+        if (data_splits_dir / "train" / "chunk_0000.parquet").exists() or list((data_splits_dir / "train").glob("chunk_*.parquet")):
+            # Structure: data_splits_dir/train/ (data_splits_dir is dataset_name, files directly in train/)
             train_chunks_dir = data_splits_dir / "train"
             test_chunks_dir = data_splits_dir / "test"
+        elif (data_splits_dir / "train" / "chunks" / "chunk_0000.parquet").exists() or list((data_splits_dir / "train" / "chunks").glob("chunk_*.parquet")) if (data_splits_dir / "train" / "chunks").exists() else False:
+            # Structure: data_splits_dir/train/chunks/ (data_splits_dir is dataset_name)
+            train_chunks_dir = data_splits_dir / "train" / "chunks"
+            test_chunks_dir = data_splits_dir / "test" / "chunks"
+        elif (data_splits_dir.parent / dataset_name / "train" / "chunk_0000.parquet").exists() or list((data_splits_dir.parent / dataset_name / "train").glob("chunk_*.parquet")) if (data_splits_dir.parent / dataset_name / "train").exists() else False:
+            # Structure: data_splits_dir/dataset_name/train/ (data_splits_dir is output_dir, files directly in train/)
+            train_chunks_dir = data_splits_dir.parent / dataset_name / "train"
+            test_chunks_dir = data_splits_dir.parent / dataset_name / "test"
+        elif (data_splits_dir.parent / dataset_name / "train" / "chunks" / "chunk_0000.parquet").exists() or list((data_splits_dir.parent / dataset_name / "train" / "chunks").glob("chunk_*.parquet")) if (data_splits_dir.parent / dataset_name / "train" / "chunks").exists() else False:
+            # Structure: data_splits_dir/dataset_name/train/chunks/ (data_splits_dir is output_dir)
+            train_chunks_dir = data_splits_dir.parent / dataset_name / "train" / "chunks"
+            test_chunks_dir = data_splits_dir.parent / dataset_name / "test" / "chunks"
         else:
             # Fallback: assume chunks are directly in train/ and test/
             train_chunks_dir = data_splits_dir / "train"
@@ -157,7 +168,24 @@ def upload_to_huggingface(
         if has_train_test_split:
             # Handle train/test split case
             # Prepare train files - upload all files regardless of existing status
-            train_files = sorted(list(train_chunks_dir.glob("chunk_*.parquet"))) if train_chunks_dir.exists() else []
+            if train_chunks_dir is None or not train_chunks_dir.exists():
+                action.log(
+                    message_type="train_chunks_dir_not_found",
+                    train_chunks_dir=str(train_chunks_dir) if train_chunks_dir else None,
+                    data_splits_dir=str(data_splits_dir),
+                    dataset_name=dataset_name,
+                    has_train_test_split=has_train_test_split
+                )
+                typer.echo(f"⚠ Train chunks directory not found: {train_chunks_dir}")
+                typer.echo(f"  data_splits_dir: {data_splits_dir}")
+                typer.echo(f"  dataset_name: {dataset_name}")
+            train_files = sorted(list(train_chunks_dir.glob("chunk_*.parquet"))) if train_chunks_dir and train_chunks_dir.exists() else []
+            action.log(
+                message_type="train_files_search",
+                train_chunks_dir=str(train_chunks_dir) if train_chunks_dir else None,
+                train_chunks_dir_exists=train_chunks_dir.exists() if train_chunks_dir else False,
+                files_found=len(train_files)
+            )
             for filepath in train_files:
                 repo_path = f'{dataset_name}/train/{filepath.name}'
                 operations.append(
@@ -175,7 +203,21 @@ def upload_to_huggingface(
             )
             
             # Prepare test files - upload all files regardless of existing status
-            test_files = sorted(list(test_chunks_dir.glob("chunk_*.parquet"))) if test_chunks_dir.exists() else []
+            if test_chunks_dir is None or not test_chunks_dir.exists():
+                action.log(
+                    message_type="test_chunks_dir_not_found",
+                    test_chunks_dir=str(test_chunks_dir) if test_chunks_dir else None,
+                    data_splits_dir=str(data_splits_dir),
+                    dataset_name=dataset_name
+                )
+                typer.echo(f"⚠ Test chunks directory not found: {test_chunks_dir}")
+            test_files = sorted(list(test_chunks_dir.glob("chunk_*.parquet"))) if test_chunks_dir and test_chunks_dir.exists() else []
+            action.log(
+                message_type="test_files_search",
+                test_chunks_dir=str(test_chunks_dir) if test_chunks_dir else None,
+                test_chunks_dir_exists=test_chunks_dir.exists() if test_chunks_dir else False,
+                files_found=len(test_files)
+            )
             for filepath in test_files:
                 repo_path = f'{dataset_name}/test/{filepath.name}'
                 operations.append(
