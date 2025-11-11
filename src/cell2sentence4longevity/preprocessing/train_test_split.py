@@ -46,7 +46,7 @@ def create_train_test_split(
             if parquet_dir.name == "chunks" and parquet_dir.parent.name:
                 dataset_name = parquet_dir.parent.name
             else:
-                dataset_name = "dataset"
+                dataset_name = parquet_dir.name  # Use the directory name itself
     elif (parquet_dir.parent / "chunks" / "chunk_0000.parquet").exists():
         # New structure: parquet_dir is dataset_name, chunks are in dataset_name/chunks/
         chunks_dir = parquet_dir / "chunks"
@@ -56,7 +56,7 @@ def create_train_test_split(
         # Assume it's the chunks directory
         chunks_dir = parquet_dir
         if dataset_name is None:
-            dataset_name = "dataset"
+            dataset_name = parquet_dir.name  # Use the directory name itself
     
     # Determine chunking strategy
     use_size_based = target_mb is not None
@@ -132,10 +132,13 @@ def create_train_test_split(
         )
         action.log(message_type="age_distribution", distribution=age_counts.to_dicts())
         
-        # Collect full dataset (only when needed for sklearn)
-        action.log(message_type="loading_full_dataset")
-        full_dataset = lazy_dataset.collect()
-        total_cells_after_filtering = len(full_dataset)
+        # Count total cells after filtering (lazy)
+        total_cells_after_filtering = (
+            lazy_dataset
+            .select(pl.len())
+            .collect()
+            .item()
+        )
         
         action.log(
             message_type="filtering_summary",
@@ -158,37 +161,57 @@ def create_train_test_split(
                 warning="Some ages have very few samples, stratification might fail"
             )
         
-        # Shuffle dataset
-        action.log(message_type="shuffling_dataset")
-        full_dataset = full_dataset.sample(fraction=1.0, seed=random_state, shuffle=True)
+        # Create output directories: output_dir/dataset_name/train/ and output_dir/dataset_name/test/
+        train_dir = output_dir / dataset_name / "train"
+        test_dir = output_dir / dataset_name / "test"
+        train_dir.mkdir(parents=True, exist_ok=True)
+        test_dir.mkdir(parents=True, exist_ok=True)
         
-        # Convert to pandas for sklearn compatibility
-        action.log(message_type="creating_split")
-        full_dataset_pd = full_dataset.to_pandas()
-        
-        # Stratified split by age
-        train_df_pd, test_df_pd = sklearn_split(
-            full_dataset_pd,
-            test_size=test_size,
-            stratify=full_dataset_pd['age'],
-            random_state=random_state
+        # Use streaming stratified split with lazy API
+        # Add random column for stratified splitting (lazy operation)
+        # We use hash of age combined with row position to get deterministic but random assignment
+        # within each age group for proper stratification
+        action.log(message_type="creating_stratified_split_streaming")
+        lazy_with_split = (
+            lazy_dataset
+            .with_row_index("_row_idx")
+            .with_columns(
+                ((pl.col('age').hash(seed=random_state) + pl.col('_row_idx').hash(seed=random_state + 1)) % 10000 / 10000.0).alias('_random_split')
+            )
+            .drop('_row_idx')
         )
         
-        # Convert back to Polars
-        train_df = pl.from_pandas(train_df_pd)
-        test_df = pl.from_pandas(test_df_pd)
+        # Create train and test lazy datasets
+        lazy_train = lazy_with_split.filter(pl.col('_random_split') >= test_size).drop('_random_split')
+        lazy_test = lazy_with_split.filter(pl.col('_random_split') < test_size).drop('_random_split')
+        
+        # Count cells in each split (lazy)
+        train_cells = lazy_train.select(pl.len()).collect().item()
+        test_cells = lazy_test.select(pl.len()).collect().item()
         
         action.log(
             message_type="split_complete",
-            train_cells=len(train_df),
-            test_cells=len(test_df),
-            train_pct=round(len(train_df) / total_cells_after_filtering * 100, 2),
-            test_pct=round(len(test_df) / total_cells_after_filtering * 100, 2)
+            train_cells=train_cells,
+            test_cells=test_cells,
+            train_pct=round(train_cells / total_cells_after_filtering * 100, 2) if total_cells_after_filtering > 0 else 0,
+            test_pct=round(test_cells / total_cells_after_filtering * 100, 2) if total_cells_after_filtering > 0 else 0
         )
         
-        # Verify stratification
-        train_age_counts = train_df.group_by('age').agg(pl.len().alias('count')).sort('age')
-        test_age_counts = test_df.group_by('age').agg(pl.len().alias('count')).sort('age')
+        # Verify stratification (lazy)
+        train_age_counts = (
+            lazy_train
+            .group_by('age')
+            .agg(pl.len().alias('count'))
+            .sort('age')
+            .collect()
+        )
+        test_age_counts = (
+            lazy_test
+            .group_by('age')
+            .agg(pl.len().alias('count'))
+            .sort('age')
+            .collect()
+        )
         action.log(
             message_type="train_age_distribution",
             distribution=train_age_counts.to_dicts()
@@ -198,39 +221,46 @@ def create_train_test_split(
             distribution=test_age_counts.to_dicts()
         )
         
-        # Save train and test sets
+        # Save train and test sets using streaming sink_parquet
         action.log(message_type="saving_splits")
         
-        # Create output directories: output_dir/dataset_name/train/chunks/ and output_dir/dataset_name/test/chunks/
-        train_chunks_dir = output_dir / dataset_name / "train" / "chunks"
-        test_chunks_dir = output_dir / dataset_name / "test" / "chunks"
-        train_chunks_dir.mkdir(parents=True, exist_ok=True)
-        test_chunks_dir.mkdir(parents=True, exist_ok=True)
-        
-        def save_chunks(df: pl.DataFrame, chunks_dir: Path, split_name: str) -> int:
-            """Save DataFrame in chunks, returning number of chunks created."""
+        def save_chunks_streaming(lazy_df: pl.LazyFrame, output_dir: Path, split_name: str) -> int:
+            """Save LazyFrame in chunks using streaming, returning number of chunks created."""
             chunk_idx = 0
             
             if use_size_based:
                 target_bytes = int(target_mb * 1024 * 1024)
-                batch_size = 5000
+                batch_size = 10000  # Process in batches
                 
                 row_idx = 0
-                current_chunk_data = None
+                current_chunk_batches = []
+                chunk_start_row = 0
                 
-                while row_idx < len(df):
-                    batch_end = min(row_idx + batch_size, len(df))
-                    batch_df = df[row_idx:batch_end]
+                # Get total rows (lazy)
+                total_rows = lazy_df.select(pl.len()).collect().item()
+                
+                while row_idx < total_rows:
+                    # Collect batch lazily using streaming
+                    batch_df = (
+                        lazy_df
+                        .slice(row_idx, batch_size)
+                        .collect(streaming=True)
+                    )
                     
-                    if current_chunk_data is None:
-                        current_chunk_data = batch_df
-                    else:
-                        current_chunk_data = pl.concat([current_chunk_data, batch_df])
+                    if batch_df.height == 0:
+                        break
                     
-                    # Check size
+                    current_chunk_batches.append(batch_df)
+                    
+                    # Check size by writing to temp file
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.parquet') as tmp_file:
                         temp_path = Path(tmp_file.name)
-                        current_chunk_data.write_parquet(
+                        # Concat batches only when checking size
+                        if len(current_chunk_batches) > 1:
+                            combined = pl.concat(current_chunk_batches)
+                        else:
+                            combined = current_chunk_batches[0]
+                        combined.write_parquet(
                             temp_path,
                             compression=compression,
                             compression_level=compression_level,
@@ -239,27 +269,46 @@ def create_train_test_split(
                         file_size = temp_path.stat().st_size
                         os.unlink(temp_path)
                     
-                    if file_size >= target_bytes or batch_end == len(df):
-                        output_file = chunks_dir / f"chunk_{chunk_idx:04d}.parquet"
-                        current_chunk_data.write_parquet(
+                    batch_end = row_idx + batch_df.height
+                    
+                    if file_size >= target_bytes or batch_end >= total_rows:
+                        # Write chunk
+                        if len(current_chunk_batches) > 1:
+                            chunk_data = pl.concat(current_chunk_batches)
+                        else:
+                            chunk_data = current_chunk_batches[0]
+                        
+                        output_file = output_dir / f"{dataset_name}_{chunk_start_row:07d}_{batch_end:07d}.parquet"
+                        chunk_data.write_parquet(
                             output_file,
                             compression=compression,
                             compression_level=compression_level,
                             use_pyarrow=use_pyarrow,
                         )
                         chunk_idx += 1
-                        current_chunk_data = None
+                        current_chunk_batches = []
+                        chunk_start_row = batch_end
                     
                     row_idx = batch_end
             else:
-                # Row-based chunking
-                n_chunks = (len(df) + chunk_size - 1) // chunk_size
+                # Row-based chunking with streaming
+                total_rows = lazy_df.select(pl.len()).collect().item()
+                n_chunks = (total_rows + chunk_size - 1) // chunk_size
+                
                 for i in range(n_chunks):
                     start_idx = i * chunk_size
-                    end_idx = min(start_idx + chunk_size, len(df))
-                    chunk = df[start_idx:end_idx]
+                    end_idx = min(start_idx + chunk_size, total_rows)
+                    
+                    # Collect chunk lazily using streaming
+                    chunk = (
+                        lazy_df
+                        .slice(start_idx, end_idx - start_idx)
+                        .collect(streaming=True)
+                    )
+                    
+                    output_file = output_dir / f"{dataset_name}_{start_idx:07d}_{end_idx:07d}.parquet"
                     chunk.write_parquet(
-                        chunks_dir / f"chunk_{i:04d}.parquet",
+                        output_file,
                         compression=compression,
                         compression_level=compression_level,
                         use_pyarrow=use_pyarrow,
@@ -268,17 +317,17 @@ def create_train_test_split(
             
             return chunk_idx
         
-        # Save train set in chunks
+        # Save train set in chunks using streaming
         action.log(message_type="saving_train_chunks")
-        n_train_chunks = save_chunks(train_df, train_chunks_dir, "train")
+        n_train_chunks = save_chunks_streaming(lazy_train, train_dir, "train")
         
-        # Save test set in chunks
+        # Save test set in chunks using streaming
         action.log(message_type="saving_test_chunks")
-        n_test_chunks = save_chunks(test_df, test_chunks_dir, "test")
+        n_test_chunks = save_chunks_streaming(lazy_test, test_dir, "test")
         
         # Calculate sizes
-        train_size = sum(f.stat().st_size for f in train_chunks_dir.glob("*.parquet"))
-        test_size_bytes = sum(f.stat().st_size for f in test_chunks_dir.glob("*.parquet"))
+        train_size = sum(f.stat().st_size for f in train_dir.glob("*.parquet"))
+        test_size_bytes = sum(f.stat().st_size for f in test_dir.glob("*.parquet"))
         
         action.log(
             message_type="split_saved",
@@ -286,7 +335,7 @@ def create_train_test_split(
             test_chunks=n_test_chunks,
             train_size_gb=round(train_size / (1024**3), 3),
             test_size_gb=round(test_size_bytes / (1024**3), 3),
-            train_chunks_dir=str(train_chunks_dir),
-            test_chunks_dir=str(test_chunks_dir)
+            train_dir=str(train_dir),
+            test_dir=str(test_dir)
         )
 

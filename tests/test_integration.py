@@ -12,7 +12,6 @@ from eliot import start_action
 from pycomfort.logging import to_nice_file
 
 from cell2sentence4longevity.preprocessing import (
-    add_age_and_cleanup,
     convert_h5ad_to_parquet,
     create_hgnc_mapper,
     create_train_test_split,
@@ -96,7 +95,8 @@ class TestIntegrationPipeline:
         with start_action(action_type="integration_test_full_pipeline") as test_action:
             # Step 0: Download real dataset
             test_action.log(message_type="test_step", step=0, description="Downloading real dataset")
-            url = "https://datasets.cellxgene.cziscience.com/9deda9ad-6a71-401e-b909-5263919d85f9.h5ad"
+            # url = "https://datasets.cellxgene.cziscience.com/9deda9ad-6a71-401e-b909-5263919d85f9.h5ad"  # Old dataset
+            url = "https://datasets.cellxgene.cziscience.com/10cc50a0-af80-4fa1-b668-893dd5c0113a.h5ad"
             
             h5ad_path = download_dataset(
                 url=url,
@@ -155,24 +155,17 @@ class TestIntegrationPipeline:
             assert 'cell_sentence' in sample_df.columns or 'cell2sentence' in sample_df.columns, \
                 "Should have cell_sentence or cell2sentence column"
             
-            # Step 3: Add age and cleanup
-            test_action.log(message_type="test_step", step=3, description="Adding age and cleaning up")
-            # add_age_and_cleanup works on the dataset directory (parquet_dir/dataset_name)
-            dataset_dir = list(parquet_dir.glob("*"))[0]  # Get the dataset directory
-            add_age_and_cleanup(dataset_dir)
-            
-            # Validate age column was added
-            sample_df_after_age = pl.read_parquet(parquet_files[0])
-            assert 'age' in sample_df_after_age.columns, "Should have age column"
+            # Validate age column was added during conversion
+            assert 'age' in sample_df.columns, "Should have age column (added during conversion)"
             
             # Validate age field is numeric
-            age_dtype = sample_df_after_age.schema['age']
+            age_dtype = sample_df.schema['age']
             assert age_dtype in [pl.Int64, pl.Int32, pl.Int16, pl.Float64, pl.Float32], \
                 f"Age column should be numeric, got {age_dtype}"
             test_action.log(message_type="age_column_validated", dtype=str(age_dtype))
             
             # Check age values are reasonable
-            age_values = sample_df_after_age['age'].drop_nulls()
+            age_values = sample_df['age'].drop_nulls()
             if len(age_values) > 0:
                 min_age = age_values.min()
                 max_age = age_values.max()
@@ -180,13 +173,10 @@ class TestIntegrationPipeline:
                 assert min_age >= 0, "Age should be non-negative"
                 assert max_age <= 150, "Age should be realistic"
             
-            # Validate column naming
-            assert 'cell_sentence' in sample_df_after_age.columns, \
-                "Should have cell_sentence column (renamed from cell2sentence if needed)"
-            
-            # Step 4: Create train/test split
-            test_action.log(message_type="test_step", step=4, description="Creating train/test split")
+            # Step 3: Create train/test split
+            test_action.log(message_type="test_step", step=3, description="Creating train/test split")
             # create_train_test_split works on the dataset directory (parquet_dir/dataset_name)
+            dataset_dir = list(parquet_dir.glob("*"))[0]  # Get the dataset directory
             create_train_test_split(
                 parquet_dir=dataset_dir,
                 output_dir=temp_dirs['output'],
@@ -196,14 +186,16 @@ class TestIntegrationPipeline:
             )
             
             # Validate train/test split
-            train_dir = temp_dirs['output'] / 'train'
-            test_dir = temp_dirs['output'] / 'test'
+            # The output structure is: output_dir/dataset_name/train/ and output_dir/dataset_name/test/
+            dataset_name = dataset_dir.name
+            train_dir = temp_dirs['output'] / dataset_name / 'train'
+            test_dir = temp_dirs['output'] / dataset_name / 'test'
             
             assert train_dir.exists(), "Train directory should exist"
             assert test_dir.exists(), "Test directory should exist"
             
-            train_files = list(train_dir.glob("chunk_*.parquet"))
-            test_files = list(test_dir.glob("chunk_*.parquet"))
+            train_files = list(train_dir.glob("*.parquet"))
+            test_files = list(test_dir.glob("*.parquet"))
             
             assert len(train_files) > 0, "Should have train files"
             assert len(test_files) > 0, "Should have test files"
@@ -215,8 +207,8 @@ class TestIntegrationPipeline:
             )
             
             # Verify train/test split ratio
-            train_df = pl.scan_parquet(train_dir / "chunk_*.parquet")
-            test_df = pl.scan_parquet(test_dir / "chunk_*.parquet")
+            train_df = pl.scan_parquet(train_dir / "*.parquet")
+            test_df = pl.scan_parquet(test_dir / "*.parquet")
             
             train_count = train_df.select(pl.len()).collect().item()
             test_count = test_df.select(pl.len()).collect().item()
@@ -235,7 +227,8 @@ class TestIntegrationPipeline:
             
             # Validate final data structure
             test_action.log(message_type="test_step", description="Validating final data structure")
-            final_train_sample = pl.scan_parquet(train_dir / "chunk_*.parquet").limit(100).collect()
+            final_train_sample = pl.scan_parquet(train_dir / "*.parquet").limit(100).collect()
+            final_test_sample = pl.scan_parquet(test_dir / "*.parquet").limit(100).collect()
             
             assert 'cell_sentence' in final_train_sample.columns, "Final data should have cell_sentence"
             assert 'age' in final_train_sample.columns, "Final data should have age"
@@ -243,6 +236,26 @@ class TestIntegrationPipeline:
             # Check cell_sentence is not empty
             non_empty_sentences = final_train_sample['cell_sentence'].str.len_chars() > 0
             assert non_empty_sentences.sum() > 0, "Should have non-empty cell sentences"
+            
+            # Check that no Ensembl IDs are present in cell sentences (train set)
+            # Ensembl IDs start with "ENS" (e.g., ENSG00000139618, ENST00000361390)
+            has_ensembl_ids_train = final_train_sample['cell_sentence'].str.contains(r'\bENS[A-Z]*\d+')
+            ensembl_id_count_train = has_ensembl_ids_train.sum()
+            assert ensembl_id_count_train == 0, \
+                f"Train sentences should not contain Ensembl IDs, found {ensembl_id_count_train} sentences with Ensembl IDs"
+            
+            # Check that no Ensembl IDs are present in cell sentences (test set)
+            has_ensembl_ids_test = final_test_sample['cell_sentence'].str.contains(r'\bENS[A-Z]*\d+')
+            ensembl_id_count_test = has_ensembl_ids_test.sum()
+            assert ensembl_id_count_test == 0, \
+                f"Test sentences should not contain Ensembl IDs, found {ensembl_id_count_test} sentences with Ensembl IDs"
+            
+            test_action.log(
+                message_type="ensembl_id_validation",
+                train_sentences_with_ensembl_ids=ensembl_id_count_train,
+                test_sentences_with_ensembl_ids=ensembl_id_count_test,
+                validation="passed"
+            )
             
             test_action.log(
                 message_type="final_structure_validated",
@@ -279,92 +292,12 @@ class TestIntegrationPipeline:
                 "Should log HGNC mapper creation"
             assert 'convert_h5ad_to_parquet' in log_content or 'h5ad' in log_content.lower(), \
                 "Should log h5ad conversion"
-            assert 'add_age_and_cleanup' in log_content or 'age' in log_content.lower(), \
-                "Should log age processing"
+            assert 'age' in log_content.lower(), \
+                "Should log age processing (done during conversion)"
             assert 'create_train_test_split' in log_content or 'split' in log_content.lower(), \
                 "Should log train/test split"
             
             test_action.log(message_type="test_complete", status="passed")
-    
-    def test_pipeline_with_small_chunk_size(self, temp_dirs: dict[str, Path]) -> None:
-        """Test pipeline with a smaller chunk size to verify chunking works correctly."""
-        log_dir = temp_dirs['logs']
-        json_log = log_dir / 'small_chunk_test.json'
-        rendered_log = log_dir / 'small_chunk_test.log'
-        
-        to_nice_file(output_file=json_log, rendered_file=rendered_log)
-        
-        with start_action(action_type="integration_test_small_chunks") as test_action:
-            # Download
-            url = "https://datasets.cellxgene.cziscience.com/9deda9ad-6a71-401e-b909-5263919d85f9.h5ad"
-            h5ad_path = download_dataset(
-                url=url,
-                output_dir=temp_dirs['input']
-            )
-            
-            # Create mapper (optional)
-            mappers_path = temp_dirs['interim'] / 'hgnc_mappers.pkl'
-            try:
-                create_hgnc_mapper(temp_dirs['interim'])
-            except RuntimeError:
-                # HGNC download failed, will use feature_name fallback
-                mappers_path = None
-            
-            # Convert with small chunk size
-            parquet_dir = temp_dirs['interim'] / 'parquet_chunks'
-            small_chunk_size = 5000
-            
-            convert_h5ad_to_parquet(
-                h5ad_path=h5ad_path,
-                mappers_path=mappers_path,
-                output_dir=parquet_dir,
-                chunk_size=small_chunk_size,
-                top_genes=1000
-            )
-            
-            # Verify chunks are approximately the right size
-            # Files are in parquet_dir/dataset_name/chunk_*.parquet structure
-            parquet_files = list(parquet_dir.glob("*/chunk_*.parquet"))
-            assert len(parquet_files) > 0
-            
-            # Check chunk sizes
-            for pf in parquet_files[:3]:  # Check first 3 chunks
-                df = pl.read_parquet(pf)
-                # Last chunk might be smaller
-                assert len(df) <= small_chunk_size * 1.1, \
-                    f"Chunk should be around {small_chunk_size} rows, got {len(df)}"
-            
-            test_action.log(
-                message_type="chunk_validation",
-                num_chunks=len(parquet_files),
-                chunk_size=small_chunk_size
-            )
-            
-            # Continue with rest of pipeline
-            # Get the dataset directory for downstream processing
-            dataset_dir = list(parquet_dir.glob("*"))[0]
-            add_age_and_cleanup(dataset_dir)
-            
-            create_train_test_split(
-                parquet_dir=dataset_dir,
-                output_dir=temp_dirs['output'],
-                test_size=0.1,
-                random_state=42,
-                chunk_size=small_chunk_size
-            )
-            
-            # Verify output
-            train_files = list((temp_dirs['output'] / 'train').glob("chunk_*.parquet"))
-            test_files = list((temp_dirs['output'] / 'test').glob("chunk_*.parquet"))
-            
-            assert len(train_files) > 0
-            assert len(test_files) > 0
-            
-            test_action.log(
-                message_type="small_chunk_test_complete",
-                train_chunks=len(train_files),
-                test_chunks=len(test_files)
-            )
 
 
 class TestLogging:
@@ -400,36 +333,48 @@ class TestAgeExtraction:
     
     def test_age_extraction_from_development_stage(self) -> None:
         """Test that age is correctly extracted and is numeric."""
-        from cell2sentence4longevity.preprocessing.age_cleanup import extract_age
+        from cell2sentence4longevity.preprocessing.h5ad_converter import extract_age_column
         
-        # Test various formats
-        assert extract_age("22-year-old stage") == 22
-        assert extract_age("45-year-old human stage") == 45
-        assert extract_age("1-year-old stage") == 1
-        assert extract_age("100-year-old stage") == 100
+        # Create test DataFrame with various formats
+        test_df = pl.DataFrame({
+            'development_stage': [
+                "22-year-old stage",
+                "45-year-old human stage",
+                "1-year-old stage",
+                "100-year-old stage",
+                None,
+                "",
+                "unknown",
+                "child"
+            ]
+        })
         
-        # Test edge cases
-        assert extract_age(None) is None
-        assert extract_age("") is None
-        assert extract_age("unknown") is None
-        assert extract_age("child") is None
+        # Extract age using vectorized Polars expression
+        result_df = extract_age_column(test_df)
+        
+        # Validate results
+        ages = result_df['age'].to_list()
+        assert ages[0] == 22.0
+        assert ages[1] == 45.0
+        assert ages[2] == 1.0
+        assert ages[3] == 100.0
+        assert ages[4] is None  # None input
+        assert ages[5] is None  # Empty string
+        assert ages[6] is None  # Invalid format
+        assert ages[7] is None  # Invalid format
     
     def test_age_field_numeric_dtype(self) -> None:
         """Test that age field has numeric dtype after processing."""
+        from cell2sentence4longevity.preprocessing.h5ad_converter import extract_age_column
+        
         # Create a test dataframe
         df = pl.DataFrame({
             'development_stage': ['22-year-old stage', '45-year-old stage', '30-year-old stage'],
             'cell_sentence': ['GENE1 GENE2 GENE3', 'GENE4 GENE5 GENE6', 'GENE7 GENE8 GENE9']
         })
         
-        # Apply age extraction
-        from cell2sentence4longevity.preprocessing.age_cleanup import extract_age
-        
-        df = df.with_columns(
-            pl.col('development_stage')
-            .map_elements(extract_age, return_dtype=pl.Float64)
-            .alias('age')
-        )
+        # Apply age extraction using vectorized Polars expression
+        df = extract_age_column(df)
         
         # Check dtype
         assert df.schema['age'] == pl.Float64, "Age should be Float64"

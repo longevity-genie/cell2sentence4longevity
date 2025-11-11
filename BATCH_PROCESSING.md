@@ -2,7 +2,7 @@
 
 ## Overview
 
-The CLI now supports batch processing of multiple h5ad files with memory-efficient processing, per-file logging, error handling, and automatic cleanup of interim files.
+The CLI now supports batch processing of multiple h5ad files with **one-step streaming conversion**, memory-efficient processing, per-file logging, and error handling.
 
 ## Key Features
 
@@ -12,11 +12,17 @@ The CLI now supports batch processing of multiple h5ad files with memory-efficie
 - Failures in one file don't stop processing of others
 - Progress tracking and summary reporting
 
-### 2. **Memory Management** (Critical for Terabytes of Data)
-- **Automatic garbage collection** after each processing step
-- **Interim file cleanup** (disabled with `--keep-interim` flag)
-- Cleans up parquet chunks after creating train/test splits
-- Cleans up partial files on errors
+### 2. **One-Step Streaming Conversion** (NEW!)
+- **No interim files created** - everything happens in a single streaming pass
+- Reads h5ad → creates cell sentences → extracts age → splits train/test → writes output
+- Memory efficient: data flows through pipeline without intermediate storage
+- Significantly faster than two-step approach
+
+### 3. **Memory Management** (Critical for Terabytes of Data)
+- **Automatic garbage collection** after each file
+- **No interim files** to clean up (one-step approach)
+- **Chunked processing**: Never loads entire datasets into memory
+- **Backed h5ad loading**: Uses AnnData's backed mode
 - Memory is freed between processing different h5ad files
 
 ### 3. **Dataset Name Sanitization**
@@ -34,21 +40,16 @@ Example:
 ```
 
 ### 4. **Per-File Directory Structure**
+
+**One-Step Approach (Current):**
 ```
 data/
-├── interim/
-│   └── parquet_chunks/
-│       ├── dataset1_name/
-│       │   └── chunks/
-│       │       ├── chunk_0000.parquet
-│       │       └── ...
-│       └── dataset2_name/
-│           └── chunks/
-│               └── ...
 ├── output/
 │   ├── dataset1_name/
 │   │   ├── train/
 │   │   │   └── chunks/
+│   │   │       ├── chunk_0000.parquet
+│   │   │       └── ...
 │   │   └── test/
 │   │       └── chunks/
 │   └── dataset2_name/
@@ -59,6 +60,8 @@ data/
     └── dataset2_name/
         └── pipeline.log
 ```
+
+**Note:** No interim files are created with the one-step approach!
 
 ### 5. **Per-File Logging**
 - Each dataset gets its own log directory
@@ -93,16 +96,11 @@ uv run preprocess run-all --batch-mode --input-dir data/input
 # Or provide directory as argument
 uv run preprocess run-all data/input --batch-mode
 
-# With memory-efficient cleanup (default)
+# With custom output directory
 uv run preprocess run-all --batch-mode \
   --input-dir data/input \
   --output-dir data/output \
   --log-dir logs
-
-# Keep interim files (for debugging)
-uv run preprocess run-all --batch-mode \
-  --input-dir data/input \
-  --keep-interim
 ```
 
 ### With HuggingFace Upload
@@ -119,25 +117,27 @@ uv run preprocess run-all --batch-mode \
 # - ...
 ```
 
-### Step-by-Step with Batch Mode
+### Step-by-Step Mode (Legacy, Two-Step Approach)
+
+If you need to run individual steps separately:
+
 ```bash
-# Step 2: Convert all h5ad files
+# Step 2: Convert all h5ad files to interim parquet (creates interim files)
 uv run preprocess step2-convert-h5ad --batch-mode
 
-# Step 3: Add age to all datasets
-uv run preprocess step3-add-age --batch-mode
-
-# Step 4: Create splits for all
-# (requires manual iteration currently)
+# Step 3: Create train/test splits from interim files
+uv run preprocess step3-train-test-split --interim-dir data/interim/parquet_chunks
 ```
+
+**Note:** The `run-all` command now uses the one-step approach, which is faster and more memory efficient.
 
 ## Command-Line Options
 
 ### New Options
 
 - `--batch-mode`: Enable batch processing of all h5ad files in input directory
-- `--keep-interim`: Keep interim parquet files after processing (default: False, cleanup to save space)
 - `--log-dir PATH`: Directory for log files (default: `./logs`)
+- `--skip-train-test-split`: Skip train/test splitting (writes all data to single directory)
 
 ### Existing Options
 
@@ -154,18 +154,18 @@ uv run preprocess step3-add-age --batch-mode
 
 For processing terabytes of data, the implementation ensures:
 
-1. **Lazy loading**: Polars `scan_parquet` for streaming operations
-2. **Chunked processing**: Never loads entire datasets into memory
-3. **Forced garbage collection**: `gc.collect()` after each step
-4. **Interim cleanup**: Removes large intermediate files after use
+1. **One-step streaming**: No interim files created, data flows from h5ad → output directly
+2. **Backed h5ad loading**: AnnData backed mode prevents loading entire file into memory
+3. **Chunked processing**: Processes data in configurable chunks (default: 10,000 cells)
+4. **Forced garbage collection**: `gc.collect()` after each file
 5. **File isolation**: Each file processed independently, memory freed between files
 
 ## Error Handling
 
 - Per-file try-catch blocks
 - Failures logged but don't stop batch processing
-- Partial interim files cleaned up on errors (unless `--keep-interim`)
 - Summary report shows success/failure for each file
+- Memory freed even on errors via forced garbage collection
 
 ## Example Output
 
@@ -180,22 +180,11 @@ PROCESSING FILE 1/3: my_dataset
 ================================================================================
 
 ================================================================================
-STEP 2: Converting my_dataset to parquet
+PROCESSING: my_dataset
+Converting h5ad, extracting age, and creating train/test split in one pass
 ================================================================================
-✓ Step 2 complete for my_dataset
-
-================================================================================
-STEP 3: Adding age and cleaning up my_dataset
-================================================================================
-✓ Step 3 complete for my_dataset
-
-================================================================================
-STEP 4: Creating train/test split for my_dataset
-================================================================================
-✓ Step 4 complete for my_dataset
-
-Cleaning up interim files for my_dataset...
-✓ Interim files cleaned up
+Processing chunks: 100%|███████████████████| 150/150 [00:15:32<00:00,  6.21s/it]
+✓ Conversion complete for my_dataset
 
 ================================================================================
 PROCESSING FILE 2/3: another_dataset
@@ -227,4 +216,5 @@ All existing functionality is preserved:
 - Single file processing still works as before
 - All individual step commands (step1, step2, etc.) still work
 - Backward compatible with existing scripts and workflows
+
 

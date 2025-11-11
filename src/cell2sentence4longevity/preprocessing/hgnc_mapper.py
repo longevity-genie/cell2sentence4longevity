@@ -32,8 +32,24 @@ def download_hgnc_data(output_dir: Path) -> pl.DataFrame | None:
             response = requests.get(url, timeout=120, headers=headers)
             response.raise_for_status()
             
-            # Use Polars to read the TSV data
-            hgnc_df = pl.read_csv(io.StringIO(response.text), separator='\t')
+            # Use Polars to read the TSV data with schema overrides
+            # omim_id and other columns can have pipe-separated values like "312095|465000"
+            schema_overrides = {
+                'omim_id': pl.String,
+                'ena': pl.String,
+                'refseq_accession': pl.String,
+                'ccds_id': pl.String,
+                'uniprot_ids': pl.String,
+                'pubmed_id': pl.String,
+                'mgd_id': pl.String,
+                'rgd_id': pl.String
+            }
+            hgnc_df = pl.read_csv(
+                io.StringIO(response.text), 
+                separator='\t',
+                schema_overrides=schema_overrides,
+                infer_schema_length=10000
+            )
             action.log(message_type="download_success", gene_count=len(hgnc_df))
             
             # Save to file
@@ -48,7 +64,23 @@ def download_hgnc_data(output_dir: Path) -> pl.DataFrame | None:
             # Check if local file exists as fallback
             action.log(message_type="checking_local_file")
             if output_file.exists():
-                hgnc_df = pl.read_csv(output_file, separator='\t')
+                # Use same schema overrides for local file
+                schema_overrides = {
+                    'omim_id': pl.String,
+                    'ena': pl.String,
+                    'refseq_accession': pl.String,
+                    'ccds_id': pl.String,
+                    'uniprot_ids': pl.String,
+                    'pubmed_id': pl.String,
+                    'mgd_id': pl.String,
+                    'rgd_id': pl.String
+                }
+                hgnc_df = pl.read_csv(
+                    output_file, 
+                    separator='\t',
+                    schema_overrides=schema_overrides,
+                    infer_schema_length=10000
+                )
                 action.log(message_type="loaded_from_local", gene_count=len(hgnc_df))
                 return hgnc_df
             
@@ -80,55 +112,72 @@ def create_mappers(hgnc_df: pl.DataFrame) -> Dict[str, Dict[str, str]]:
             if old_name in hgnc_df.columns:
                 hgnc_df = hgnc_df.rename({old_name: new_name})
         
-        # 1. Ensembl ID -> Official Symbol
+        # 1. Ensembl ID -> Official Symbol (vectorized - much faster than iter_rows)
         action.log(message_type="creating_mapper", mapper_type="ensembl_to_symbol")
-        ensembl_to_symbol = {}
-        for row in hgnc_df.filter(
+        filtered_df = hgnc_df.filter(
             pl.col('ensembl_gene_id').is_not_null() & pl.col('symbol').is_not_null()
-        ).iter_rows(named=True):
-            ensembl_to_symbol[row['ensembl_gene_id']] = row['symbol']
+        ).select(['ensembl_gene_id', 'symbol'])
+        # Use to_dict with as_series=False to get dict of lists, then convert to dict
+        ensembl_to_symbol = dict(zip(
+            filtered_df['ensembl_gene_id'].to_list(),
+            filtered_df['symbol'].to_list()
+        ))
         action.log(message_type="mapper_created", mapper_type="ensembl_to_symbol", count=len(ensembl_to_symbol))
         mappers['ensembl_to_symbol'] = ensembl_to_symbol
         
-        # 2. Symbol -> Ensembl ID
+        # 2. Symbol -> Ensembl ID (vectorized - much faster than iter_rows)
         action.log(message_type="creating_mapper", mapper_type="symbol_to_ensembl")
-        symbol_to_ensembl = {}
-        for row in hgnc_df.filter(
+        filtered_df = hgnc_df.filter(
             pl.col('symbol').is_not_null() & pl.col('ensembl_gene_id').is_not_null()
-        ).iter_rows(named=True):
-            symbol_to_ensembl[row['symbol']] = row['ensembl_gene_id']
+        ).select(['symbol', 'ensembl_gene_id'])
+        symbol_to_ensembl = dict(zip(
+            filtered_df['symbol'].to_list(),
+            filtered_df['ensembl_gene_id'].to_list()
+        ))
         action.log(message_type="mapper_created", mapper_type="symbol_to_ensembl", count=len(symbol_to_ensembl))
         mappers['symbol_to_ensembl'] = symbol_to_ensembl
         
         # 3. Previous symbols -> Official Symbol
+        # This requires splitting strings, so we keep the loop but optimize the filtering
         action.log(message_type="creating_mapper", mapper_type="prev_to_symbol")
         prev_to_symbol = {}
-        for row in hgnc_df.filter(
+        # Pre-filter to avoid unnecessary iteration
+        prev_symbol_df = hgnc_df.filter(
             pl.col('prev_symbol').is_not_null() & pl.col('symbol').is_not_null()
-        ).iter_rows(named=True):
-            prev_symbols = str(row['prev_symbol']).split(',')
+        ).select(['prev_symbol', 'symbol'])
+        
+        for prev_sym_str, symbol in zip(prev_symbol_df['prev_symbol'].to_list(), 
+                                         prev_symbol_df['symbol'].to_list()):
+            # Split by comma or pipe
+            prev_symbols = str(prev_sym_str).split(',')
             if len(prev_symbols) == 1:
-                prev_symbols = str(row['prev_symbol']).split('|')
+                prev_symbols = str(prev_sym_str).split('|')
             for prev_sym in prev_symbols:
                 prev_sym = prev_sym.strip()
                 if prev_sym:
-                    prev_to_symbol[prev_sym] = row['symbol']
+                    prev_to_symbol[prev_sym] = symbol
         action.log(message_type="mapper_created", mapper_type="prev_to_symbol", count=len(prev_to_symbol))
         mappers['prev_to_symbol'] = prev_to_symbol
         
         # 4. Alias symbols -> Official Symbol
+        # This requires splitting strings, so we keep the loop but optimize the filtering
         action.log(message_type="creating_mapper", mapper_type="alias_to_symbol")
         alias_to_symbol = {}
-        for row in hgnc_df.filter(
+        # Pre-filter to avoid unnecessary iteration
+        alias_symbol_df = hgnc_df.filter(
             pl.col('alias_symbol').is_not_null() & pl.col('symbol').is_not_null()
-        ).iter_rows(named=True):
-            alias_symbols = str(row['alias_symbol']).split(',')
+        ).select(['alias_symbol', 'symbol'])
+        
+        for alias_sym_str, symbol in zip(alias_symbol_df['alias_symbol'].to_list(),
+                                          alias_symbol_df['symbol'].to_list()):
+            # Split by comma or pipe
+            alias_symbols = str(alias_sym_str).split(',')
             if len(alias_symbols) == 1:
-                alias_symbols = str(row['alias_symbol']).split('|')
+                alias_symbols = str(alias_sym_str).split('|')
             for alias_sym in alias_symbols:
                 alias_sym = alias_sym.strip()
                 if alias_sym:
-                    alias_to_symbol[alias_sym] = row['symbol']
+                    alias_to_symbol[alias_sym] = symbol
         action.log(message_type="mapper_created", mapper_type="alias_to_symbol", count=len(alias_to_symbol))
         mappers['alias_to_symbol'] = alias_to_symbol
         

@@ -6,6 +6,7 @@ import pickle
 import time
 import tempfile
 import os
+import re
 
 import anndata as ad
 import numpy as np
@@ -14,6 +15,32 @@ from tqdm import tqdm
 import polars as pl
 
 from cell2sentence4longevity.preprocessing.hgnc_mapper import create_hgnc_mapper, load_mappers
+
+
+def extract_age_column(df: pl.DataFrame, source_col: str = 'development_stage') -> pl.DataFrame:
+    """Extract age in years from development_stage column using Polars regex.
+    
+    This is much faster than using map_elements as it's fully vectorized.
+    
+    Args:
+        df: Polars DataFrame with development_stage column
+        source_col: Name of the column containing development stage info
+        
+    Returns:
+        DataFrame with added 'age' column (Float64)
+    """
+    if source_col not in df.columns:
+        # No source column, create null age column
+        return df.with_columns(pl.lit(None).cast(pl.Float64).alias('age'))
+    
+    # Use Polars regex to extract age - much faster than map_elements
+    # Pattern matches "22-year-old" or "22.5-year-old"
+    return df.with_columns(
+        pl.col(source_col)
+        .str.extract(r'(\d+(?:\.\d+)?)-year-old', 1)  # Extract first capture group
+        .cast(pl.Float64, strict=False)  # Cast to float, null if not a number
+        .alias('age')
+    )
 
 
 def has_gene_symbols(adata: ad.AnnData) -> bool:
@@ -37,6 +64,32 @@ def has_gene_symbols(adata: ad.AnnData) -> bool:
     ensembl_like_count = sum(1 for name in sample_names if name.startswith("ENS"))
     
     # If more than 50% look like Ensembl IDs, assume they are Ensembl IDs
+    return ensembl_like_count < (sample_size * 0.5)
+
+
+def feature_name_has_gene_symbols(adata: ad.AnnData) -> bool:
+    """Check if AnnData feature_name column contains gene symbols rather than Ensembl IDs.
+    
+    Args:
+        adata: AnnData object
+        
+    Returns:
+        True if feature_name contains gene symbols, False otherwise
+    """
+    if 'feature_name' not in adata.var.columns:
+        return False
+    
+    if adata.n_vars == 0:
+        return False
+    
+    # Check a sample of feature_names to determine if they're Ensembl IDs
+    sample_size = min(100, adata.n_vars)
+    sample_features = [adata.var['feature_name'].iloc[i] for i in range(sample_size)]
+    
+    # Count how many look like Ensembl IDs
+    ensembl_like_count = sum(1 for name in sample_features if str(name).startswith("ENS"))
+    
+    # If more than 50% look like Ensembl IDs, assume feature_name doesn't have gene symbols
     return ensembl_like_count < (sample_size * 0.5)
 
 
@@ -91,68 +144,125 @@ def load_h5ad_data(h5ad_path: Path) -> ad.AnnData:
         return adata
 
 
-def map_genes_to_symbols(
-    adata: ad.AnnData, 
-    ensembl_to_symbol: Dict[str, str],
-    use_hgnc: bool = False
+def map_genes_to_symbols_polars(
+    adata: ad.AnnData,
+    hgnc_df: pl.DataFrame | None = None,
+    use_hgnc: bool = True
 ) -> List[str]:
-    """Map Ensembl IDs to gene symbols or use existing gene symbols.
+    """Map Ensembl IDs to gene symbols using Polars for fast joins.
     
     Args:
         adata: AnnData object
-        ensembl_to_symbol: Mapping dictionary from Ensembl ID to gene symbol (only used if use_hgnc=True)
+        hgnc_df: HGNC DataFrame with mapping data (only used if use_hgnc=True)
         use_hgnc: Whether to use HGNC mapping (True) or use var_names directly (False)
         
     Returns:
-        List of gene symbols
+        List of gene symbols (Ensembl IDs are filtered out during sentence creation)
     """
-    with start_action(action_type="map_genes_to_symbols", use_hgnc=use_hgnc) as action:
-        # Access var_names without converting to list to save memory
+    with start_action(action_type="map_genes_to_symbols_polars", use_hgnc=use_hgnc) as action:
         n_genes = adata.n_vars
-        gene_symbols = []
-        mapped_count = 0
-        fallback_count = 0
-        missing_count = 0
-        direct_use_count = 0
-        
         action.log(message_type="starting_gene_mapping", total_genes=n_genes, use_hgnc=use_hgnc)
         
         if not use_hgnc:
-            # Use var_names directly as gene symbols
-            for gene_name in adata.var_names:
-                gene_symbols.append(gene_name)
-                direct_use_count += 1
+            # Check if we should use feature_name instead of var_names
+            has_feature_name = 'feature_name' in adata.var.columns
+            use_feature_name = False
+            
+            if has_feature_name:
+                # Sample a few feature_names to check if they're gene symbols
+                sample_size = min(100, n_genes)
+                sample_features = [adata.var['feature_name'].iloc[i] for i in range(sample_size)]
+                feature_ensembl_count = sum(1 for name in sample_features if str(name).startswith("ENS"))
+                
+                # If feature_name has fewer Ensembl IDs than var_names, prefer feature_name
+                if feature_ensembl_count < (sample_size * 0.5):
+                    use_feature_name = True
+                    action.log(message_type="using_feature_name_column", reason="contains_gene_symbols")
+            
+            if use_feature_name:
+                gene_symbols = [str(adata.var['feature_name'].iloc[i]) for i in range(n_genes)]
+            else:
+                gene_symbols = list(adata.var_names)
             
             action.log(
                 message_type="gene_mapping_summary",
                 total_genes=len(gene_symbols),
-                mapped_via_hgnc=0,
-                mapped_via_fallback=0,
-                unmapped_using_ensembl_id=0,
-                direct_use=direct_use_count,
-                hgnc_mapping_percentage=0.0,
-                fallback_percentage=0.0,
-                unmapped_percentage=0.0
+                used_feature_name=use_feature_name
             )
             return gene_symbols
         
-        # Use HGNC mapping
-        # Iterate through var_names directly instead of creating a list
-        for i, ens_id in enumerate(adata.var_names):
-            if ens_id in ensembl_to_symbol:
-                symbol = ensembl_to_symbol[ens_id]
-                gene_symbols.append(symbol)
-                mapped_count += 1
-            else:
-                # Fallback to feature_name if HGNC doesn't have mapping
-                if 'feature_name' in adata.var.columns:
-                    symbol = adata.var['feature_name'].iloc[i]
-                    gene_symbols.append(symbol)
-                    fallback_count += 1
-                else:
-                    # No feature_name available, use ensembl ID directly
-                    gene_symbols.append(ens_id)
-                    missing_count += 1
+        # Use HGNC mapping with Polars join (much faster than dict lookup!)
+        action.log(message_type="preparing_polars_join")
+        
+        # Normalize HGNC column names if needed
+        col_map = {
+            'Ensembl gene ID': 'ensembl_gene_id',
+            'Approved symbol': 'symbol'
+        }
+        for old_name, new_name in col_map.items():
+            if old_name in hgnc_df.columns:
+                hgnc_df = hgnc_df.rename({old_name: new_name})
+        
+        # Create DataFrame from adata with var_names and feature_name
+        has_feature_name = 'feature_name' in adata.var.columns
+        
+        if has_feature_name:
+            genes_df = pl.DataFrame({
+                'ensembl_gene_id': list(adata.var_names),
+                'feature_name': [str(adata.var['feature_name'].iloc[i]) for i in range(n_genes)],
+                'original_index': list(range(n_genes))
+            })
+        else:
+            genes_df = pl.DataFrame({
+                'ensembl_gene_id': list(adata.var_names),
+                'original_index': list(range(n_genes))
+            })
+        
+        # Join with HGNC to get official symbols
+        action.log(message_type="performing_hgnc_join")
+        hgnc_mapping = hgnc_df.select(['ensembl_gene_id', 'symbol']).filter(
+            pl.col('ensembl_gene_id').is_not_null() & pl.col('symbol').is_not_null()
+        )
+        
+        # Left join to keep all genes
+        mapped_df = genes_df.join(hgnc_mapping, on='ensembl_gene_id', how='left')
+        
+        # Determine final gene symbol with fallback logic
+        if has_feature_name:
+            # Priority: 1) HGNC symbol, 2) feature_name (if not Ensembl ID), 3) ensembl_gene_id
+            mapped_df = mapped_df.with_columns([
+                pl.when(pl.col('symbol').is_not_null())
+                .then(pl.col('symbol'))
+                .when(~pl.col('feature_name').str.starts_with("ENS"))
+                .then(pl.col('feature_name'))
+                .otherwise(pl.col('ensembl_gene_id'))
+                .alias('final_symbol')
+            ])
+        else:
+            # Priority: 1) HGNC symbol, 2) ensembl_gene_id
+            mapped_df = mapped_df.with_columns([
+                pl.when(pl.col('symbol').is_not_null())
+                .then(pl.col('symbol'))
+                .otherwise(pl.col('ensembl_gene_id'))
+                .alias('final_symbol')
+            ])
+        
+        # Sort by original index to maintain order
+        mapped_df = mapped_df.sort('original_index')
+        
+        # Extract gene symbols list
+        gene_symbols = mapped_df['final_symbol'].to_list()
+        
+        # Calculate statistics
+        mapped_count = mapped_df.filter(pl.col('symbol').is_not_null()).height
+        if has_feature_name:
+            fallback_count = mapped_df.filter(
+                pl.col('symbol').is_null() & 
+                ~pl.col('feature_name').str.starts_with("ENS")
+            ).height
+        else:
+            fallback_count = 0
+        missing_count = n_genes - mapped_count - fallback_count
         
         action.log(
             message_type="gene_mapping_summary",
@@ -165,18 +275,6 @@ def map_genes_to_symbols(
             unmapped_percentage=round(missing_count / n_genes * 100, 2) if n_genes else 0
         )
         
-        if missing_count > 0:
-            # Log sample unmapped genes for debugging (only first 10)
-            unmapped_samples = []
-            count = 0
-            for ens_id in adata.var_names:
-                if ens_id not in ensembl_to_symbol and 'feature_name' not in adata.var.columns:
-                    unmapped_samples.append(ens_id)
-                    count += 1
-                    if count >= 10:
-                        break
-            action.log(message_type="sample_unmapped_genes", samples=unmapped_samples)
-        
         return gene_symbols
 
 
@@ -184,6 +282,7 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
     """Create cell sentence from expression data.
     
     Uses argpartition for faster top-k selection (O(n) vs O(n log n) for full sort).
+    Filters out Ensembl IDs to ensure only proper gene symbols are included.
     
     Args:
         cell_expr: Expression values for a single cell
@@ -191,20 +290,37 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
         top_n: Number of top genes to include in sentence
         
     Returns:
-        Space-separated string of top expressed genes
+        Space-separated string of top expressed genes (excluding Ensembl IDs)
     """
+    # First, filter out Ensembl IDs (genes starting with "ENS")
+    # Create a mask for valid gene symbols (not Ensembl IDs)
+    valid_mask = np.array([not str(gene).startswith("ENS") for gene in gene_symbols], dtype=bool)
+    
+    # Get indices of valid genes
+    valid_indices = np.where(valid_mask)[0]
+    
+    # If we don't have enough valid genes, use what we have
+    if len(valid_indices) == 0:
+        # Fallback: no valid genes, return empty string or use all genes anyway
+        # For now, let's return empty to make the problem visible
+        return ""
+    
+    # Filter expression and symbols to only valid genes
+    valid_expr = cell_expr[valid_indices]
+    valid_symbols = gene_symbols[valid_indices]
+    
     # Use argpartition for faster top-k selection (much faster than full sort)
-    # Get indices of top N expressed genes
-    if top_n >= len(cell_expr):
-        top_gene_indices = np.argsort(cell_expr)[::-1]
+    # Get indices of top N expressed genes from valid genes
+    if top_n >= len(valid_expr):
+        top_gene_indices = np.argsort(valid_expr)[::-1]
     else:
         # argpartition is O(n) vs argsort which is O(n log n)
-        top_gene_indices = np.argpartition(cell_expr, -top_n)[-top_n:]
+        top_gene_indices = np.argpartition(valid_expr, -top_n)[-top_n:]
         # Sort only the top N (much smaller than sorting all)
-        top_gene_indices = top_gene_indices[np.argsort(cell_expr[top_gene_indices])[::-1]]
+        top_gene_indices = top_gene_indices[np.argsort(valid_expr[top_gene_indices])[::-1]]
     
     # Convert to gene symbols using numpy array indexing (faster than list comprehension)
-    top_genes = gene_symbols[top_gene_indices]
+    top_genes = valid_symbols[top_gene_indices]
     # Create space-separated string
     return ' '.join(top_genes.tolist())
 
@@ -270,71 +386,78 @@ def convert_h5ad_to_parquet(
         # Determine if we need HGNC mapping
         # Use HGNC if:
         # 1. User explicitly provided mappers_path, OR
-        # 2. AnnData doesn't have gene symbols (var_names are Ensembl IDs and no feature_name)
+        # 2. AnnData doesn't have gene symbols in var_names AND feature_name doesn't have them either
         has_symbols = has_gene_symbols(adata)
+        feature_has_symbols = feature_name_has_gene_symbols(adata)
         user_provided_mappers = mappers_path is not None and mappers_path.exists()
-        needs_hgnc = user_provided_mappers or (not has_symbols and 'feature_name' not in adata.var.columns)
+        
+        # Need HGNC if: user provided mappers OR (no gene symbols in var_names AND no gene symbols in feature_name)
+        needs_hgnc = user_provided_mappers or (not has_symbols and not feature_has_symbols)
         
         action.log(
             message_type="hgnc_usage_decision",
             has_gene_symbols=has_symbols,
+            feature_name_has_gene_symbols=feature_has_symbols,
             user_provided_mappers=user_provided_mappers,
             has_feature_name='feature_name' in adata.var.columns,
-            will_use_hgnc=needs_hgnc
+            will_use_hgnc=True
         )
         
-        # Load mappers if needed
-        ensembl_to_symbol = {}
-        use_hgnc = False
-        if needs_hgnc:
-            if user_provided_mappers:
-                action.log(message_type="loading_mappers", path=str(mappers_path))
-                try:
-                    mappers = load_mappers(mappers_path)
-                    ensembl_to_symbol = mappers['ensembl_to_symbol']
-                    action.log(message_type="mappers_loaded", mapper_count=len(ensembl_to_symbol))
-                    use_hgnc = True
-                except Exception as e:
-                    action.log(message_type="mappers_load_failed", error=str(e), 
-                              fallback="Will try to create HGNC mapper automatically")
-                    # Try to create HGNC mapper automatically
-                    try:
-                        hgnc_dir = output_dir.parent / "hgnc_mappers"
-                        hgnc_dir.mkdir(parents=True, exist_ok=True)
-                        mappers = create_hgnc_mapper(hgnc_dir)
-                        ensembl_to_symbol = mappers['ensembl_to_symbol']
-                        action.log(message_type="hgnc_created_automatically", mapper_count=len(ensembl_to_symbol))
-                        use_hgnc = True
-                    except Exception as create_error:
-                        action.log(message_type="hgnc_auto_create_failed", error=str(create_error),
-                                  fallback="Will use var_names or feature_name from h5ad")
-                        use_hgnc = False
+        # Load HGNC DataFrame (use Polars for fast joins!)
+        # Use HGNC by default - download/create it automatically
+        hgnc_df = None
+        use_hgnc = True
+        action.log(message_type="loading_hgnc_data_as_dataframe")
+        try:
+            # Check if we have a cached TSV file
+            hgnc_dir = output_dir.parent / "hgnc_mappers"
+            hgnc_dir.mkdir(parents=True, exist_ok=True)
+            hgnc_tsv = hgnc_dir / "hgnc_complete_set.tsv"
+            
+            if hgnc_tsv.exists():
+                # Load from cached TSV
+                action.log(message_type="loading_hgnc_from_cache", path=str(hgnc_tsv))
+                schema_overrides = {
+                    'omim_id': pl.String,
+                    'ena': pl.String,
+                    'refseq_accession': pl.String,
+                    'ccds_id': pl.String,
+                    'uniprot_ids': pl.String,
+                    'pubmed_id': pl.String,
+                    'mgd_id': pl.String,
+                    'rgd_id': pl.String
+                }
+                hgnc_df = pl.read_csv(hgnc_tsv, separator='\t', schema_overrides=schema_overrides, infer_schema_length=10000)
+                action.log(message_type="hgnc_loaded_from_cache", gene_count=len(hgnc_df))
+                use_hgnc = True
             else:
-                # Try to create HGNC mapper automatically since it's needed
-                action.log(message_type="hgnc_needed_creating_automatically",
-                          reason="var_names_are_ensembl_ids_and_no_feature_name")
-                try:
-                    hgnc_dir = output_dir.parent / "hgnc_mappers"
-                    hgnc_dir.mkdir(parents=True, exist_ok=True)
-                    mappers = create_hgnc_mapper(hgnc_dir)
-                    ensembl_to_symbol = mappers['ensembl_to_symbol']
-                    action.log(message_type="hgnc_created_automatically", mapper_count=len(ensembl_to_symbol))
+                # Download and create HGNC data
+                from cell2sentence4longevity.preprocessing.hgnc_mapper import download_hgnc_data
+                action.log(message_type="downloading_hgnc_data")
+                hgnc_df = download_hgnc_data(hgnc_dir)
+                if hgnc_df is not None:
+                    action.log(message_type="hgnc_downloaded", gene_count=len(hgnc_df))
                     use_hgnc = True
-                except Exception as create_error:
-                    action.log(message_type="hgnc_auto_create_failed", error=str(create_error),
-                              fallback="Will use var_names directly (Ensembl IDs)")
+                else:
+                    action.log(message_type="hgnc_download_failed",
+                              fallback="Will use var_names or feature_name from h5ad")
                     use_hgnc = False
-        else:
-            action.log(message_type="skipping_hgnc", 
-                      reason="var_names_appear_to_be_gene_symbols")
+        except Exception as e:
+            action.log(message_type="hgnc_loading_failed", error=str(e),
+                      fallback="Will use var_names or feature_name from h5ad")
+            use_hgnc = False
         
-        # Map genes to symbols
-        gene_symbols_list = map_genes_to_symbols(adata, ensembl_to_symbol, use_hgnc=use_hgnc)
+        # Map genes to symbols using Polars
+        gene_symbols_list = map_genes_to_symbols_polars(adata, hgnc_df, use_hgnc=use_hgnc)
         # Convert to numpy array for faster indexing
         gene_symbols = np.array(gene_symbols_list, dtype=object)
         
         # Create output directory structure: output_dir/dataset_name/
-        chunks_dir = output_dir / dataset_name
+        # If output_dir already ends with dataset_name, use it directly (avoid double nesting)
+        if output_dir.name == dataset_name:
+            chunks_dir = output_dir
+        else:
+            chunks_dir = output_dir / dataset_name
         chunks_dir.mkdir(parents=True, exist_ok=True)
         action.log(message_type="output_directory_created", chunks_dir=str(chunks_dir))
         
@@ -396,6 +519,8 @@ def convert_h5ad_to_parquet(
                 
                 # Check size by creating DataFrame and writing to temp file
                 chunk_df = pl.DataFrame(current_chunk_data)
+                # Add age column using Polars expression
+                chunk_df = extract_age_column(chunk_df)
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.parquet') as tmp_file:
                     temp_path = Path(tmp_file.name)
                     chunk_df.write_parquet(
@@ -465,6 +590,8 @@ def convert_h5ad_to_parquet(
                     
                     # Create Polars DataFrame directly
                     chunk_df = pl.DataFrame(chunk_obs_data)
+                    # Add age column using Polars expression
+                    chunk_df = extract_age_column(chunk_df)
                     
                     output_file = chunks_dir / f"chunk_{chunk_idx:04d}.parquet"
                     # Use compression and other optimizations for faster writes
@@ -506,4 +633,413 @@ def convert_h5ad_to_parquet(
             h5ad_file=str(h5ad_path),
             chunks_dir=str(chunks_dir)
         )
+
+
+def convert_h5ad_to_train_test(
+    h5ad_path: Path,
+    mappers_path: Path | None = None,
+    output_dir: Path = Path("./output"),
+    dataset_name: str | None = None,
+    chunk_size: int = 10000,
+    top_genes: int = 2000,
+    test_size: float = 0.05,
+    random_state: int = 42,
+    compression: str = "zstd",
+    compression_level: int = 3,
+    use_pyarrow: bool = True,
+    skip_train_test_split: bool = False,
+    stratify_by_age: bool = True
+) -> None:
+    """Convert h5ad file directly to train/test parquet splits in one streaming pass.
+    
+    This unified function:
+    1. Reads h5ad chunks
+    2. Creates cell sentences
+    3. Extracts age from development_stage
+    4. Assigns cells to train/test split (stratified by age using pure Polars)
+    5. Writes directly to train/test output directories
+    
+    No interim files, no pandas/sklearn conversion - pure Polars for memory efficiency.
+    
+    Args:
+        h5ad_path: Path to the h5ad file
+        mappers_path: Path to the HGNC mappers pickle file (optional)
+        output_dir: Directory to save train/test splits
+        dataset_name: Name of the dataset for folder organization. If None, uses h5ad filename stem
+        chunk_size: Number of cells per chunk
+        top_genes: Number of top expressed genes per cell
+        test_size: Proportion of data for test set (0.0 to 1.0)
+        random_state: Random seed for reproducibility
+        compression: Compression algorithm for parquet files
+        compression_level: Compression level
+        use_pyarrow: Use pyarrow backend for parquet writes
+        skip_train_test_split: If True, writes all data to output_dir without splitting
+        stratify_by_age: If True, maintains age distribution in train/test splits (default: True)
+    """
+    start_time = time.time()
+    
+    # Determine dataset name
+    if dataset_name is None:
+        dataset_name = h5ad_path.stem
+    
+    with start_action(
+        action_type="convert_h5ad_to_train_test",
+        h5ad_path=str(h5ad_path),
+        output_dir=str(output_dir),
+        dataset_name=dataset_name,
+        chunk_size=chunk_size,
+        top_genes=top_genes,
+        test_size=test_size,
+        skip_train_test_split=skip_train_test_split,
+        stratify_by_age=stratify_by_age
+    ) as action:
+        action.log(message_type="processing_started", h5ad_file=str(h5ad_path))
+        
+        # Load h5ad first to check if we need HGNC
+        adata = load_h5ad_data(h5ad_path)
+        
+        # Determine if we need HGNC mapping
+        has_symbols = has_gene_symbols(adata)
+        feature_has_symbols = feature_name_has_gene_symbols(adata)
+        user_provided_mappers = mappers_path is not None and mappers_path.exists()
+        
+        # Need HGNC if: user provided mappers OR (no gene symbols in var_names AND no gene symbols in feature_name)
+        needs_hgnc = user_provided_mappers or (not has_symbols and not feature_has_symbols)
+        
+        action.log(
+            message_type="hgnc_usage_decision",
+            has_gene_symbols=has_symbols,
+            feature_name_has_gene_symbols=feature_has_symbols,
+            user_provided_mappers=user_provided_mappers,
+            has_feature_name='feature_name' in adata.var.columns,
+            will_use_hgnc=True
+        )
+        
+        # Load HGNC DataFrame (use Polars for fast joins!)
+        # Use HGNC by default - download/create it automatically
+        hgnc_df = None
+        use_hgnc = True
+        action.log(message_type="loading_hgnc_data_as_dataframe")
+        try:
+            # Check if we have a cached TSV file
+            hgnc_dir = output_dir.parent / "hgnc_mappers"
+            hgnc_dir.mkdir(parents=True, exist_ok=True)
+            hgnc_tsv = hgnc_dir / "hgnc_complete_set.tsv"
+            
+            if hgnc_tsv.exists():
+                # Load from cached TSV
+                action.log(message_type="loading_hgnc_from_cache", path=str(hgnc_tsv))
+                schema_overrides = {
+                    'omim_id': pl.String,
+                    'ena': pl.String,
+                    'refseq_accession': pl.String,
+                    'ccds_id': pl.String,
+                    'uniprot_ids': pl.String,
+                    'pubmed_id': pl.String,
+                    'mgd_id': pl.String,
+                    'rgd_id': pl.String
+                }
+                hgnc_df = pl.read_csv(hgnc_tsv, separator='\t', schema_overrides=schema_overrides, infer_schema_length=10000)
+                action.log(message_type="hgnc_loaded_from_cache", gene_count=len(hgnc_df))
+                use_hgnc = True
+            else:
+                # Download and create HGNC data
+                from cell2sentence4longevity.preprocessing.hgnc_mapper import download_hgnc_data
+                action.log(message_type="downloading_hgnc_data")
+                hgnc_df = download_hgnc_data(hgnc_dir)
+                if hgnc_df is not None:
+                    action.log(message_type="hgnc_downloaded", gene_count=len(hgnc_df))
+                    use_hgnc = True
+                else:
+                    action.log(message_type="hgnc_download_failed",
+                              fallback="Will use var_names or feature_name from h5ad")
+                    use_hgnc = False
+        except Exception as e:
+            action.log(message_type="hgnc_loading_failed", error=str(e),
+                      fallback="Will use var_names or feature_name from h5ad")
+            use_hgnc = False
+        
+        # Map genes to symbols using Polars
+        gene_symbols_list = map_genes_to_symbols_polars(adata, hgnc_df, use_hgnc=use_hgnc)
+        gene_symbols = np.array(gene_symbols_list, dtype=object)
+        
+        # Create output directory structure
+        if skip_train_test_split:
+            # Single output directory
+            output_chunks_dir = output_dir / dataset_name / "chunks"
+            output_chunks_dir.mkdir(parents=True, exist_ok=True)
+            action.log(message_type="output_directory_created", 
+                      output_dir=str(output_chunks_dir),
+                      mode="single_directory")
+        else:
+            # Train/test split directories
+            train_dir = output_dir / dataset_name / "train" / "chunks"
+            test_dir = output_dir / dataset_name / "test" / "chunks"
+            train_dir.mkdir(parents=True, exist_ok=True)
+            test_dir.mkdir(parents=True, exist_ok=True)
+            action.log(message_type="output_directories_created",
+                      train_dir=str(train_dir),
+                      test_dir=str(test_dir),
+                      mode="train_test_split")
+        
+        # Get column names from obs once (outside loop)
+        obs_columns = list(adata.obs.columns)
+        
+        # Helper: ensure Polars-compatible arrays
+        def _to_polars_compatible(values) -> np.ndarray:
+            dtype_name = getattr(values, "dtype", None)
+            dtype_name = getattr(dtype_name, "name", None)
+            if dtype_name == "category":
+                return values.astype(str).to_numpy()
+            return values.to_numpy() if hasattr(values, "to_numpy") else np.asarray(values, dtype=object)
+        
+        n_cells = adata.n_obs
+        n_chunks = (n_cells + chunk_size - 1) // chunk_size
+        
+        # Initialize counters for train/test
+        train_chunk_idx = 0
+        test_chunk_idx = 0
+        train_buffer = []
+        test_buffer = []
+        train_buffer_data = {}
+        test_buffer_data = {}
+        
+        # Setup random number generator for reproducible splits
+        rng = np.random.RandomState(random_state)
+        
+        # Statistics
+        total_cells_processed = 0
+        cells_with_null_age = 0
+        cells_filtered_out = 0
+        train_cells = 0
+        test_cells = 0
+        
+        action.log(message_type="starting_chunk_processing", 
+                  total_chunks=n_chunks,
+                  cells_per_chunk=chunk_size)
+        
+        for chunk_idx in tqdm(range(n_chunks), desc='Processing chunks'):
+            with start_action(action_type="process_chunk", chunk_idx=chunk_idx) as chunk_action:
+                start_idx = chunk_idx * chunk_size
+                end_idx = min(start_idx + chunk_size, n_cells)
+                
+                # Read chunk of expression matrix
+                chunk_X = adata.X[start_idx:end_idx].toarray()
+                
+                # Create cell sentences for each cell in chunk
+                cell_sentences = [
+                    create_cell_sentence(cell_expr, gene_symbols, top_genes)
+                    for cell_expr in chunk_X
+                ]
+                
+                # Build chunk data with all metadata
+                chunk_obs_data = {}
+                for col in obs_columns:
+                    series_slice = adata.obs[col].iloc[start_idx:end_idx]
+                    chunk_obs_data[col] = _to_polars_compatible(series_slice)
+                
+                # Add cell_sentence column
+                chunk_obs_data['cell_sentence'] = cell_sentences
+                
+                # Create Polars DataFrame
+                chunk_df = pl.DataFrame(chunk_obs_data)
+                
+                # Extract age using vectorized Polars regex (much faster than map_elements)
+                chunk_df = extract_age_column(chunk_df)
+                
+                if 'development_stage' not in chunk_df.columns:
+                    chunk_action.log(message_type="warning_no_development_stage",
+                                   warning="No development_stage column found, age will be null")
+                
+                # Count null ages in this chunk
+                null_ages_in_chunk = chunk_df.filter(pl.col('age').is_null()).height
+                cells_with_null_age += null_ages_in_chunk
+                
+                # Filter out null ages
+                chunk_df = chunk_df.filter(pl.col('age').is_not_null())
+                cells_filtered_out += null_ages_in_chunk
+                total_cells_processed += (end_idx - start_idx)
+                
+                if chunk_df.height == 0:
+                    chunk_action.log(message_type="chunk_empty_after_filtering",
+                                   warning="All cells filtered out due to null age")
+                    continue
+                
+                chunk_action.log(message_type="chunk_processed",
+                               cells_in=end_idx - start_idx,
+                               cells_after_age_filter=chunk_df.height,
+                               cells_filtered=null_ages_in_chunk)
+                
+                # Split into train/test or write to single directory
+                if skip_train_test_split:
+                    # Write entire chunk to single output directory
+                    output_file = output_chunks_dir / f"chunk_{chunk_idx:04d}.parquet"
+                    chunk_df.write_parquet(
+                        output_file,
+                        compression=compression,
+                        compression_level=compression_level,
+                        use_pyarrow=use_pyarrow,
+                    )
+                    chunk_action.log(message_type="chunk_saved",
+                                   output_file=str(output_file),
+                                   rows=len(chunk_df))
+                else:
+                    # Stratified or random split using pure Polars
+                    if stratify_by_age:
+                        # Stratified split: maintain age distribution across train/test
+                        # Add random number for stratified sampling within each age group
+                        chunk_df = chunk_df.with_columns(
+                            pl.lit(rng.random(chunk_df.height)).alias('_random_split')
+                        )
+                        
+                        # For each age group, split proportionally
+                        # Group by age, then filter by random number threshold
+                        train_chunk = (
+                            chunk_df
+                            .group_by('age', maintain_order=True)
+                            .agg(pl.all())
+                            .explode(pl.all().exclude('age'))
+                            .filter(pl.col('_random_split') >= test_size)
+                            .drop('_random_split')
+                        )
+                        
+                        test_chunk = (
+                            chunk_df
+                            .group_by('age', maintain_order=True)
+                            .agg(pl.all())
+                            .explode(pl.all().exclude('age'))
+                            .filter(pl.col('_random_split') < test_size)
+                            .drop('_random_split')
+                        )
+                    else:
+                        # Simple random split (faster, no stratification)
+                        split_assignments = rng.random(chunk_df.height) >= test_size
+                        train_chunk = chunk_df.filter(pl.Series(split_assignments))
+                        test_chunk = chunk_df.filter(~pl.Series(split_assignments))
+                    
+                    train_cells += train_chunk.height
+                    test_cells += test_chunk.height
+                    
+                    # Add to buffers
+                    if train_chunk.height > 0:
+                        train_buffer.append(train_chunk)
+                        
+                        # Check if we should flush train buffer
+                        total_buffered = sum(df.height for df in train_buffer)
+                        if total_buffered >= chunk_size:
+                            # Concatenate and write
+                            train_df_combined = pl.concat(train_buffer)
+                            output_file = train_dir / f"chunk_{train_chunk_idx:04d}.parquet"
+                            train_df_combined.write_parquet(
+                                output_file,
+                                compression=compression,
+                                compression_level=compression_level,
+                                use_pyarrow=use_pyarrow,
+                            )
+                            chunk_action.log(message_type="train_chunk_saved",
+                                           output_file=str(output_file),
+                                           rows=len(train_df_combined))
+                            train_chunk_idx += 1
+                            train_buffer = []
+                    
+                    if test_chunk.height > 0:
+                        test_buffer.append(test_chunk)
+                        
+                        # Check if we should flush test buffer
+                        total_buffered = sum(df.height for df in test_buffer)
+                        if total_buffered >= chunk_size:
+                            # Concatenate and write
+                            test_df_combined = pl.concat(test_buffer)
+                            output_file = test_dir / f"chunk_{test_chunk_idx:04d}.parquet"
+                            test_df_combined.write_parquet(
+                                output_file,
+                                compression=compression,
+                                compression_level=compression_level,
+                                use_pyarrow=use_pyarrow,
+                            )
+                            chunk_action.log(message_type="test_chunk_saved",
+                                           output_file=str(output_file),
+                                           rows=len(test_df_combined))
+                            test_chunk_idx += 1
+                            test_buffer = []
+                
+                # Clear memory
+                del chunk_X, cell_sentences, chunk_obs_data, chunk_df
+        
+        # Flush remaining buffers
+        if not skip_train_test_split:
+            if train_buffer:
+                train_df_combined = pl.concat(train_buffer)
+                output_file = train_dir / f"chunk_{train_chunk_idx:04d}.parquet"
+                train_df_combined.write_parquet(
+                    output_file,
+                    compression=compression,
+                    compression_level=compression_level,
+                    use_pyarrow=use_pyarrow,
+                )
+                action.log(message_type="final_train_chunk_saved",
+                          output_file=str(output_file),
+                          rows=len(train_df_combined))
+                train_chunk_idx += 1
+            
+            if test_buffer:
+                test_df_combined = pl.concat(test_buffer)
+                output_file = test_dir / f"chunk_{test_chunk_idx:04d}.parquet"
+                test_df_combined.write_parquet(
+                    output_file,
+                    compression=compression,
+                    compression_level=compression_level,
+                    use_pyarrow=use_pyarrow,
+                )
+                action.log(message_type="final_test_chunk_saved",
+                          output_file=str(output_file),
+                          rows=len(test_df_combined))
+                test_chunk_idx += 1
+        
+        adata.file.close()
+        
+        # Calculate and log total processing time
+        end_time = time.time()
+        processing_time_seconds = end_time - start_time
+        
+        # Format time as hh:mm:ss
+        hours = int(processing_time_seconds // 3600)
+        minutes = int((processing_time_seconds % 3600) // 60)
+        seconds = int(processing_time_seconds % 60)
+        processing_time_formatted = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        
+        # Log statistics
+        if skip_train_test_split:
+            action.log(
+                message_type="conversion_complete",
+                total_cells_processed=total_cells_processed,
+                cells_with_null_age=cells_with_null_age,
+                cells_filtered_out=cells_filtered_out,
+                cells_written=total_cells_processed - cells_filtered_out,
+                processing_time_seconds=round(processing_time_seconds, 2),
+                processing_time_formatted=processing_time_formatted,
+                h5ad_file=str(h5ad_path),
+                output_dir=str(output_chunks_dir)
+            )
+        else:
+            actual_test_ratio = test_cells / (train_cells + test_cells) if (train_cells + test_cells) > 0 else 0
+            action.log(
+                message_type="conversion_complete_with_split",
+                total_cells_processed=total_cells_processed,
+                cells_with_null_age=cells_with_null_age,
+                cells_filtered_out=cells_filtered_out,
+                train_cells=train_cells,
+                test_cells=test_cells,
+                train_chunks=train_chunk_idx,
+                test_chunks=test_chunk_idx,
+                actual_test_ratio=round(actual_test_ratio, 4),
+                target_test_ratio=test_size,
+                stratified=stratify_by_age,
+                split_method="stratified_by_age" if stratify_by_age else "random",
+                processing_time_seconds=round(processing_time_seconds, 2),
+                processing_time_formatted=processing_time_formatted,
+                h5ad_file=str(h5ad_path),
+                train_dir=str(train_dir),
+                test_dir=str(test_dir)
+            )
 

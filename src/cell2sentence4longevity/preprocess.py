@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from cell2sentence4longevity.preprocessing import (
     create_hgnc_mapper,
     convert_h5ad_to_parquet,
-    add_age_and_cleanup,
+    convert_h5ad_to_train_test,
     create_train_test_split,
     upload_to_huggingface,
     download_dataset,
@@ -303,62 +303,10 @@ def step2_convert_h5ad(
                 typer.secho(f"  {status} {dataset_name}: {message}", fg=color)
 
 
-@app.command()
-def step3_add_age(
-    interim_dir: Path = typer.Option(
-        Path("./data/interim/parquet_chunks"),
-        "--interim-dir",
-        "-i",
-        help="Directory containing interim parquet chunks (can contain subdirectories for multiple datasets)"
-    ),
-    log_file: Optional[Path] = typer.Option(
-        None,
-        "--log-file",
-        "-l",
-        help="Path to eliot log file"
-    ),
-    batch_mode: bool = typer.Option(
-        False,
-        "--batch-mode",
-        help="Process all dataset subdirectories in interim_dir (default: False)"
-    ),
-) -> None:
-    """Step 3: Add age column and cleanup.
-    
-    Extracts age as integer from development_stage field and ensures proper column naming.
-    
-    Batch Mode:
-    - Use --batch-mode to process all dataset subdirectories
-    - Each subdirectory is treated as a separate dataset
-    """
-    if log_file and not batch_mode:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        json_path = log_file.with_suffix('.json')
-        to_nice_file(output_file=json_path, rendered_file=log_file)
-    
-    with start_action(action_type="cli_step3_add_age", batch_mode=batch_mode):
-        if batch_mode:
-            # Process all subdirectories
-            dataset_dirs = [d for d in interim_dir.iterdir() if d.is_dir()]
-            typer.echo(f"Found {len(dataset_dirs)} dataset(s) in {interim_dir}")
-            
-            for dataset_dir in dataset_dirs:
-                dataset_name = dataset_dir.name
-                typer.echo(f"\nProcessing: {dataset_name}")
-                try:
-                    add_age_and_cleanup(dataset_dir)
-                    typer.secho(f"✓ Age added and cleanup completed for {dataset_name}", fg=typer.colors.GREEN)
-                except Exception as e:
-                    typer.secho(f"✗ Error processing {dataset_name}: {e}", fg=typer.colors.RED)
-        else:
-            # Single directory processing
-            typer.echo("Step 3: Adding age and cleaning up...")
-            add_age_and_cleanup(interim_dir)
-            typer.secho("✓ Age added and cleanup completed", fg=typer.colors.GREEN)
 
 
 @app.command()
-def step4_train_test_split(
+def step3_train_test_split(
     interim_dir: Path = typer.Option(
         Path("./data/interim/parquet_chunks"),
         "--interim-dir",
@@ -396,7 +344,7 @@ def step4_train_test_split(
         help="Path to eliot log file"
     ),
 ) -> None:
-    """Step 4: Create stratified train/test split.
+    """Step 3: Create stratified train/test split.
     
     Creates a train/test split stratified by age to maintain age distribution in both sets.
     """
@@ -405,15 +353,15 @@ def step4_train_test_split(
         json_path = log_file.with_suffix('.json')
         to_nice_file(output_file=json_path, rendered_file=log_file)
     
-    with start_action(action_type="cli_step4_train_test_split"):
-        typer.echo("Step 4: Creating train/test split...")
+    with start_action(action_type="cli_step3_train_test_split"):
+        typer.echo("Step 3: Creating train/test split...")
         create_train_test_split(interim_dir, output_dir, test_size, random_state, chunk_size)
         typer.secho("✓ Train/test split created successfully", fg=typer.colors.GREEN)
         typer.echo(f"Output: {output_dir}")
 
 
 @app.command()
-def step5_upload(
+def step4_upload(
     output_dir: Path = typer.Option(
         Path("./data/output"),
         "--output-dir",
@@ -445,7 +393,7 @@ def step5_upload(
         help="Path to eliot log file"
     ),
 ) -> None:
-    """Step 5: Upload to HuggingFace.
+    """Step 4: Upload to HuggingFace.
     
     Uploads the processed data to HuggingFace in a single batch commit.
     """
@@ -454,8 +402,8 @@ def step5_upload(
         json_path = log_file.with_suffix('.json')
         to_nice_file(output_file=json_path, rendered_file=log_file)
     
-    with start_action(action_type="cli_step5_upload"):
-        typer.echo("Step 5: Uploading to HuggingFace...")
+    with start_action(action_type="cli_step4_upload"):
+        typer.echo("Step 4: Uploading to HuggingFace...")
         upload_to_huggingface(output_dir, token, repo_id, readme_path)
         typer.secho("✓ Upload completed successfully", fg=typer.colors.GREEN)
         typer.echo(f"Dataset: https://huggingface.co/datasets/{repo_id}")
@@ -479,9 +427,16 @@ def _process_single_file(
 ) -> tuple[bool, str]:
     """Process a single h5ad file through the entire pipeline.
     
+    This uses the one-step convert_h5ad_to_train_test() function which:
+    - Reads h5ad file
+    - Creates cell sentences
+    - Extracts age from development_stage
+    - Splits into train/test (if not skipped)
+    - Writes directly to output (no interim files)
+    
     Args:
         h5ad_path: Path to the h5ad file
-        interim_dir: Base interim directory
+        interim_dir: Base interim directory (unused in one-step approach)
         output_dir: Base output directory
         chunk_size: Number of cells per chunk
         top_genes: Number of top genes per cell
@@ -493,94 +448,69 @@ def _process_single_file(
         repo_id: HuggingFace repository ID
         token: HuggingFace token
         mappers_path: Path to HGNC mappers
-        keep_interim: Whether to keep interim files after processing
+        keep_interim: Whether to keep interim files (unused in one-step approach)
         
     Returns:
         Tuple of (success: bool, message: str)
     """
     dataset_name = sanitize_dataset_name(h5ad_path.stem)
-    parquet_dir = interim_dir / "parquet_chunks" / dataset_name
     
     with start_action(action_type="process_single_file", dataset_name=dataset_name, h5ad_path=str(h5ad_path)) as action:
         try:
-            # Step 2: Convert h5ad to parquet
+            # One-step conversion: h5ad -> cell sentences + age extraction -> train/test split -> output
             typer.echo("="*80)
-            typer.echo(f"STEP 2: Converting {dataset_name} to parquet")
+            typer.echo(f"PROCESSING: {dataset_name}")
+            typer.echo("Converting h5ad, extracting age, and creating train/test split in one pass")
             typer.echo("="*80)
-            convert_h5ad_to_parquet(
-                h5ad_path, mappers_path, parquet_dir, chunk_size, top_genes,
-                compression=compression, compression_level=compression_level, 
-                use_pyarrow=use_pyarrow, dataset_name=dataset_name
+            
+            convert_h5ad_to_train_test(
+                h5ad_path=h5ad_path,
+                mappers_path=mappers_path,
+                output_dir=output_dir,
+                dataset_name=dataset_name,
+                chunk_size=chunk_size,
+                top_genes=top_genes,
+                test_size=test_size,
+                random_state=42,
+                compression=compression,
+                compression_level=compression_level,
+                use_pyarrow=use_pyarrow,
+                skip_train_test_split=skip_train_test_split,
+                stratify_by_age=True
             )
-            typer.secho(f"✓ Step 2 complete for {dataset_name}\n", fg=typer.colors.GREEN)
+            
+            typer.secho(f"✓ Conversion complete for {dataset_name}\n", fg=typer.colors.GREEN)
             
             # Force garbage collection to free memory
             gc.collect()
             
-            # Step 3: Add age and cleanup
-            typer.echo("="*80)
-            typer.echo(f"STEP 3: Adding age and cleaning up {dataset_name}")
-            typer.echo("="*80)
-            add_age_and_cleanup(parquet_dir)
-            typer.secho(f"✓ Step 3 complete for {dataset_name}\n", fg=typer.colors.GREEN)
-            
-            # Force garbage collection
-            gc.collect()
-            
-            # Step 4 (optional, based on skip_train_test_split flag)
+            # Determine upload directory
             if skip_train_test_split:
-                typer.echo(f"\n⚠ Skipping Step 4 (train/test split) for {dataset_name}")
-                upload_dir = parquet_dir
+                upload_dir = output_dir / dataset_name / "chunks"
             else:
-                typer.echo("="*80)
-                typer.echo(f"STEP 4: Creating train/test split for {dataset_name}")
-                typer.echo("="*80)
-                dataset_output_dir = output_dir / dataset_name
-                create_train_test_split(parquet_dir, dataset_output_dir, test_size, 42, chunk_size)
-                typer.secho(f"✓ Step 4 complete for {dataset_name}\n", fg=typer.colors.GREEN)
-                upload_dir = dataset_output_dir
-                
-                # Clean up interim files if not keeping them
-                if not keep_interim:
-                    typer.echo(f"Cleaning up interim files for {dataset_name}...")
-                    if parquet_dir.exists():
-                        shutil.rmtree(parquet_dir)
-                        action.log(message_type="interim_cleanup", dataset_name=dataset_name, cleaned_dir=str(parquet_dir))
-                        typer.secho(f"✓ Interim files cleaned up", fg=typer.colors.GREEN)
+                upload_dir = output_dir / dataset_name
             
-            # Force garbage collection
-            gc.collect()
-            
-            # Step 5 (optional)
+            # Step 4 (optional): Upload to HuggingFace
             if repo_id and token:
                 typer.echo("="*80)
-                typer.echo(f"STEP 5: Uploading {dataset_name} to HuggingFace")
+                typer.echo(f"UPLOADING: {dataset_name} to HuggingFace")
                 typer.echo("="*80)
                 # Append dataset name to repo_id for multi-file uploads
                 dataset_repo_id = f"{repo_id}-{dataset_name}" if repo_id else repo_id
                 upload_to_huggingface(upload_dir, token, dataset_repo_id, None)
-                typer.secho(f"✓ Step 5 complete for {dataset_name}\n", fg=typer.colors.GREEN)
+                typer.secho(f"✓ Upload complete for {dataset_name}\n", fg=typer.colors.GREEN)
                 typer.echo(f"Dataset: https://huggingface.co/datasets/{dataset_repo_id}")
             
             # Final garbage collection
             gc.collect()
             
-            action.log(message_type="file_processing_success", dataset_name=dataset_name, interim_kept=keep_interim)
+            action.log(message_type="file_processing_success", dataset_name=dataset_name)
             return True, f"Successfully processed {dataset_name}"
             
         except Exception as e:
             error_msg = f"Failed to process {dataset_name}: {str(e)}"
             action.log(message_type="file_processing_error", dataset_name=dataset_name, error=str(e))
             typer.secho(f"✗ Error processing {dataset_name}: {e}", fg=typer.colors.RED)
-            
-            # Try to clean up partial interim files on error (unless keep_interim is True)
-            if not keep_interim and parquet_dir.exists():
-                try:
-                    typer.echo(f"Cleaning up partial interim files for {dataset_name}...")
-                    shutil.rmtree(parquet_dir)
-                    action.log(message_type="partial_interim_cleanup", dataset_name=dataset_name, reason="error")
-                except Exception as cleanup_error:
-                    action.log(message_type="cleanup_failed", error=str(cleanup_error))
             
             # Force garbage collection even on error
             gc.collect()
@@ -688,16 +618,19 @@ def run_all(
 ) -> None:
     """Run all pipeline steps sequentially.
     
-    This command runs all preprocessing steps in order:
+    This command uses a ONE-STEP approach that processes each h5ad file in a single pass:
     1. Create HGNC mapper (optional, only if --create-hgnc or if needed)
-    2. Convert h5ad to parquet (per file)
-    3. Add age and cleanup (per file)
-    4. Create train/test split (per file, optional, can be skipped with --skip-train-test-split)
-    5. Upload to HuggingFace (per file, if repo_id and token provided)
+    2. One-step conversion per file:
+       - Read h5ad chunks
+       - Create cell sentences
+       - Extract age from development_stage
+       - Split into train/test (if not skipped)
+       - Write directly to output
+    3. Upload to HuggingFace (per file, if repo_id and token provided)
     
     Memory Management:
-    - Garbage collection is forced after each processing step
-    - Interim files are cleaned up after each file (unless --keep-interim is specified)
+    - No interim files are created (everything happens in one streaming pass)
+    - Garbage collection is forced after each file
     - This ensures efficient memory usage when processing terabytes of data
     
     Batch Mode:
