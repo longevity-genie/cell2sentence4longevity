@@ -147,11 +147,11 @@ def step2_convert_h5ad(
         "--input-dir",
         help="Directory containing input h5ad files (auto-detects if h5ad_path not provided)"
     ),
-    mappers_path: Path = typer.Option(
-        Path("./data/interim/hgnc_mappers.pkl"),
+    mappers_path: Path | None = typer.Option(
+        None,
         "--mappers",
         "-m",
-        help="Path to HGNC mappers pickle file"
+        help="Path to HGNC mappers pickle file (optional, only used if needed or explicitly provided)"
     ),
     interim_dir: Path = typer.Option(
         Path("./data/interim/parquet_chunks"),
@@ -474,7 +474,7 @@ def _process_single_file(
     skip_train_test_split: bool,
     repo_id: Optional[str],
     token: Optional[str],
-    mappers_path: Path,
+    mappers_path: Path | None,
     keep_interim: bool = False,
 ) -> tuple[bool, str]:
     """Process a single h5ad file through the entire pipeline.
@@ -674,11 +674,22 @@ def run_all(
         "--keep-interim",
         help="Keep interim parquet files after processing (default: False, clean up to save space)"
     ),
+    mappers_path: Path | None = typer.Option(
+        None,
+        "--mappers",
+        "-m",
+        help="Path to HGNC mappers pickle file (optional, only created/used if needed or explicitly provided)"
+    ),
+    create_hgnc: bool = typer.Option(
+        False,
+        "--create-hgnc",
+        help="Force creation of HGNC mapper (default: False, only created if needed)"
+    ),
 ) -> None:
     """Run all pipeline steps sequentially.
     
     This command runs all preprocessing steps in order:
-    1. Create HGNC mapper (once for all files)
+    1. Create HGNC mapper (optional, only if --create-hgnc or if needed)
     2. Convert h5ad to parquet (per file)
     3. Add age and cleanup (per file)
     4. Create train/test split (per file, optional, can be skipped with --skip-train-test-split)
@@ -731,13 +742,26 @@ def run_all(
         # Decide batch vs single mode
         process_multiple = batch_mode or len(h5ad_files) > 1
         
-        # Step 1: Create HGNC mapper (once for all files)
-        typer.echo("\n" + "="*80)
-        typer.echo("STEP 1: Creating HGNC mapper")
-        typer.echo("="*80)
-        create_hgnc_mapper(interim_dir)
-        typer.secho("✓ Step 1 complete\n", fg=typer.colors.GREEN)
-        mappers_path = interim_dir / "hgnc_mappers.pkl"
+        # Step 1: Create HGNC mapper (optional, only if requested or if mappers_path not provided)
+        mappers_path_final = mappers_path
+        if create_hgnc:
+            typer.echo("\n" + "="*80)
+            typer.echo("STEP 1: Creating HGNC mapper")
+            typer.echo("="*80)
+            try:
+                create_hgnc_mapper(interim_dir)
+                typer.secho("✓ Step 1 complete\n", fg=typer.colors.GREEN)
+                mappers_path_final = interim_dir / "hgnc_mappers.pkl"
+            except Exception as e:
+                typer.secho(f"⚠ Warning: Failed to create HGNC mapper: {e}", fg=typer.colors.YELLOW)
+                typer.echo("Will proceed without HGNC mapper (will use gene symbols from h5ad if available)\n")
+                mappers_path_final = None
+        elif mappers_path is None:
+            typer.echo("\n" + "="*80)
+            typer.echo("STEP 1: Skipping HGNC mapper creation (use --create-hgnc to create)")
+            typer.echo("="*80)
+            typer.echo("HGNC will only be used if needed (AnnData has Ensembl IDs without gene symbols)\n")
+            mappers_path_final = None
         
         # Process files
         results: list[tuple[str, bool, str]] = []
@@ -772,7 +796,7 @@ def run_all(
                 skip_train_test_split=skip_train_test_split,
                 repo_id=repo_id,
                 token=token,
-                mappers_path=mappers_path,
+                mappers_path=mappers_path_final,
                 keep_interim=keep_interim,
             )
             

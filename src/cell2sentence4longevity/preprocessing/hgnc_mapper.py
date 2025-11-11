@@ -20,47 +20,40 @@ def download_hgnc_data(output_dir: Path) -> pl.DataFrame | None:
         DataFrame with HGNC data or None if download fails
     """
     with start_action(action_type="download_hgnc_data") as action:
-        urls = [
-            # Current location (as of 2024) - Google Cloud Storage
-            "https://storage.googleapis.com/public-download-files/hgnc/tsv/hgnc_complete_set.txt",
-            # Legacy EBI FTP location (fallback)
-            "https://ftp.ebi.ac.uk/pub/databases/genenames/hgnc/tsv/hgnc_complete_set.txt",
-        ]
+        url = "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; cell2sentence4longevity/0.1)"
         }
         output_file = output_dir / "hgnc_complete_set.tsv"
         
-        for i, url in enumerate(urls, 1):
-            action.log(message_type="attempt_download", attempt=i, total=len(urls), url=url)
+        action.log(message_type="attempt_download", url=url)
+        
+        try:
+            response = requests.get(url, timeout=120, headers=headers)
+            response.raise_for_status()
             
-            try:
-                response = requests.get(url, timeout=120, headers=headers)
-                response.raise_for_status()
-                
-                # Use Polars to read the TSV data
-                hgnc_df = pl.read_csv(io.StringIO(response.text), separator='\t')
-                action.log(message_type="download_success", gene_count=len(hgnc_df))
-                
-                # Save to file
-                hgnc_df.write_csv(output_file, separator='\t')
-                action.log(message_type="saved_to_file", path=str(output_file))
-                
-                return hgnc_df
-                
-            except Exception as e:
-                action.log(message_type="download_failed", error=str(e), attempt=i)
-                continue
-        
-        # Check if local file exists
-        action.log(message_type="checking_local_file")
-        if output_file.exists():
-            hgnc_df = pl.read_csv(output_file, separator='\t')
-            action.log(message_type="loaded_from_local", gene_count=len(hgnc_df))
+            # Use Polars to read the TSV data
+            hgnc_df = pl.read_csv(io.StringIO(response.text), separator='\t')
+            action.log(message_type="download_success", gene_count=len(hgnc_df))
+            
+            # Save to file
+            hgnc_df.write_csv(output_file, separator='\t')
+            action.log(message_type="saved_to_file", path=str(output_file))
+            
             return hgnc_df
-        
-        action.log(message_type="all_downloads_failed")
-        return None
+            
+        except Exception as e:
+            action.log(message_type="download_failed", error=str(e))
+            
+            # Check if local file exists as fallback
+            action.log(message_type="checking_local_file")
+            if output_file.exists():
+                hgnc_df = pl.read_csv(output_file, separator='\t')
+                action.log(message_type="loaded_from_local", gene_count=len(hgnc_df))
+                return hgnc_df
+            
+            action.log(message_type="download_failed_no_local")
+            return None
 
 
 def create_mappers(hgnc_df: pl.DataFrame) -> Dict[str, Dict[str, str]]:

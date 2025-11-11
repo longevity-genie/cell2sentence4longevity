@@ -13,6 +13,32 @@ from eliot import start_action
 from tqdm import tqdm
 import polars as pl
 
+from cell2sentence4longevity.preprocessing.hgnc_mapper import create_hgnc_mapper, load_mappers
+
+
+def has_gene_symbols(adata: ad.AnnData) -> bool:
+    """Check if AnnData var_names appear to be gene symbols rather than Ensembl IDs.
+    
+    Args:
+        adata: AnnData object
+        
+    Returns:
+        True if var_names appear to be gene symbols, False if they look like Ensembl IDs
+    """
+    if adata.n_vars == 0:
+        return False
+    
+    # Check a sample of var_names to determine if they're Ensembl IDs
+    # Ensembl IDs typically start with "ENS" (e.g., ENSG00000139618)
+    sample_size = min(100, adata.n_vars)
+    sample_names = [adata.var_names[i] for i in range(sample_size)]
+    
+    # Count how many look like Ensembl IDs
+    ensembl_like_count = sum(1 for name in sample_names if name.startswith("ENS"))
+    
+    # If more than 50% look like Ensembl IDs, assume they are Ensembl IDs
+    return ensembl_like_count < (sample_size * 0.5)
+
 
 def load_h5ad_data(h5ad_path: Path) -> ad.AnnData:
     """Load AIDA h5ad file in backed mode.
@@ -67,27 +93,50 @@ def load_h5ad_data(h5ad_path: Path) -> ad.AnnData:
 
 def map_genes_to_symbols(
     adata: ad.AnnData, 
-    ensembl_to_symbol: Dict[str, str]
+    ensembl_to_symbol: Dict[str, str],
+    use_hgnc: bool = False
 ) -> List[str]:
-    """Map Ensembl IDs to gene symbols.
+    """Map Ensembl IDs to gene symbols or use existing gene symbols.
     
     Args:
         adata: AnnData object
-        ensembl_to_symbol: Mapping dictionary from Ensembl ID to gene symbol
+        ensembl_to_symbol: Mapping dictionary from Ensembl ID to gene symbol (only used if use_hgnc=True)
+        use_hgnc: Whether to use HGNC mapping (True) or use var_names directly (False)
         
     Returns:
         List of gene symbols
     """
-    with start_action(action_type="map_genes_to_symbols") as action:
+    with start_action(action_type="map_genes_to_symbols", use_hgnc=use_hgnc) as action:
         # Access var_names without converting to list to save memory
         n_genes = adata.n_vars
         gene_symbols = []
         mapped_count = 0
         fallback_count = 0
         missing_count = 0
+        direct_use_count = 0
         
-        action.log(message_type="starting_gene_mapping", total_genes=n_genes)
+        action.log(message_type="starting_gene_mapping", total_genes=n_genes, use_hgnc=use_hgnc)
         
+        if not use_hgnc:
+            # Use var_names directly as gene symbols
+            for gene_name in adata.var_names:
+                gene_symbols.append(gene_name)
+                direct_use_count += 1
+            
+            action.log(
+                message_type="gene_mapping_summary",
+                total_genes=len(gene_symbols),
+                mapped_via_hgnc=0,
+                mapped_via_fallback=0,
+                unmapped_using_ensembl_id=0,
+                direct_use=direct_use_count,
+                hgnc_mapping_percentage=0.0,
+                fallback_percentage=0.0,
+                unmapped_percentage=0.0
+            )
+            return gene_symbols
+        
+        # Use HGNC mapping
         # Iterate through var_names directly instead of creating a list
         for i, ens_id in enumerate(adata.var_names):
             if ens_id in ensembl_to_symbol:
@@ -215,27 +264,72 @@ def convert_h5ad_to_parquet(
     ) as action:
         action.log(message_type="processing_started", h5ad_file=str(h5ad_path))
         
-        # Load mappers if available
-        ensembl_to_symbol = {}
-        if mappers_path and mappers_path.exists():
-            action.log(message_type="loading_mappers", path=str(mappers_path))
-            try:
-                with open(mappers_path, 'rb') as f:
-                    mappers = pickle.load(f)
-                ensembl_to_symbol = mappers['ensembl_to_symbol']
-                action.log(message_type="mappers_loaded", mapper_count=len(ensembl_to_symbol))
-            except Exception as e:
-                action.log(message_type="mappers_load_failed", error=str(e), 
-                          fallback="Will use feature_name from h5ad")
-        else:
-            action.log(message_type="no_mappers_provided", 
-                      fallback="Will use feature_name from h5ad if available")
-        
-        # Load h5ad
+        # Load h5ad first to check if we need HGNC
         adata = load_h5ad_data(h5ad_path)
         
+        # Determine if we need HGNC mapping
+        # Use HGNC if:
+        # 1. User explicitly provided mappers_path, OR
+        # 2. AnnData doesn't have gene symbols (var_names are Ensembl IDs and no feature_name)
+        has_symbols = has_gene_symbols(adata)
+        user_provided_mappers = mappers_path is not None and mappers_path.exists()
+        needs_hgnc = user_provided_mappers or (not has_symbols and 'feature_name' not in adata.var.columns)
+        
+        action.log(
+            message_type="hgnc_usage_decision",
+            has_gene_symbols=has_symbols,
+            user_provided_mappers=user_provided_mappers,
+            has_feature_name='feature_name' in adata.var.columns,
+            will_use_hgnc=needs_hgnc
+        )
+        
+        # Load mappers if needed
+        ensembl_to_symbol = {}
+        use_hgnc = False
+        if needs_hgnc:
+            if user_provided_mappers:
+                action.log(message_type="loading_mappers", path=str(mappers_path))
+                try:
+                    mappers = load_mappers(mappers_path)
+                    ensembl_to_symbol = mappers['ensembl_to_symbol']
+                    action.log(message_type="mappers_loaded", mapper_count=len(ensembl_to_symbol))
+                    use_hgnc = True
+                except Exception as e:
+                    action.log(message_type="mappers_load_failed", error=str(e), 
+                              fallback="Will try to create HGNC mapper automatically")
+                    # Try to create HGNC mapper automatically
+                    try:
+                        hgnc_dir = output_dir.parent / "hgnc_mappers"
+                        hgnc_dir.mkdir(parents=True, exist_ok=True)
+                        mappers = create_hgnc_mapper(hgnc_dir)
+                        ensembl_to_symbol = mappers['ensembl_to_symbol']
+                        action.log(message_type="hgnc_created_automatically", mapper_count=len(ensembl_to_symbol))
+                        use_hgnc = True
+                    except Exception as create_error:
+                        action.log(message_type="hgnc_auto_create_failed", error=str(create_error),
+                                  fallback="Will use var_names or feature_name from h5ad")
+                        use_hgnc = False
+            else:
+                # Try to create HGNC mapper automatically since it's needed
+                action.log(message_type="hgnc_needed_creating_automatically",
+                          reason="var_names_are_ensembl_ids_and_no_feature_name")
+                try:
+                    hgnc_dir = output_dir.parent / "hgnc_mappers"
+                    hgnc_dir.mkdir(parents=True, exist_ok=True)
+                    mappers = create_hgnc_mapper(hgnc_dir)
+                    ensembl_to_symbol = mappers['ensembl_to_symbol']
+                    action.log(message_type="hgnc_created_automatically", mapper_count=len(ensembl_to_symbol))
+                    use_hgnc = True
+                except Exception as create_error:
+                    action.log(message_type="hgnc_auto_create_failed", error=str(create_error),
+                              fallback="Will use var_names directly (Ensembl IDs)")
+                    use_hgnc = False
+        else:
+            action.log(message_type="skipping_hgnc", 
+                      reason="var_names_appear_to_be_gene_symbols")
+        
         # Map genes to symbols
-        gene_symbols_list = map_genes_to_symbols(adata, ensembl_to_symbol)
+        gene_symbols_list = map_genes_to_symbols(adata, ensembl_to_symbol, use_hgnc=use_hgnc)
         # Convert to numpy array for faster indexing
         gene_symbols = np.array(gene_symbols_list, dtype=object)
         

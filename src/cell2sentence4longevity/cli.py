@@ -64,11 +64,11 @@ def step2_convert_h5ad(
         ...,
         help="Path to AIDA h5ad file"
     ),
-    mappers_path: Path = typer.Option(
-        Path("./output/hgnc_mappers.pkl"),
+    mappers_path: Path | None = typer.Option(
+        None,
         "--mappers",
         "-m",
-        help="Path to HGNC mappers pickle file"
+        help="Path to HGNC mappers pickle file (optional, only used if needed or explicitly provided)"
     ),
     output_dir: Path = typer.Option(
         Path("./output/temp_parquet"),
@@ -331,11 +331,22 @@ def run_all(
         "-l",
         help="Path to eliot log file"
     ),
+    mappers_path: Path | None = typer.Option(
+        None,
+        "--mappers",
+        "-m",
+        help="Path to HGNC mappers pickle file (optional, only created/used if needed or explicitly provided)"
+    ),
+    create_hgnc: bool = typer.Option(
+        False,
+        "--create-hgnc",
+        help="Force creation of HGNC mapper (default: False, only created if needed)"
+    ),
 ) -> None:
     """Run all pipeline steps sequentially.
     
     This command runs all preprocessing steps in order:
-    1. Create HGNC mapper
+    1. Create HGNC mapper (optional, only if --create-hgnc or if needed)
     2. Convert h5ad to parquet
     3. Add age and cleanup
     4. Create train/test split (optional, can be skipped with --skip-train-test-split)
@@ -350,21 +361,34 @@ def run_all(
         to_nice_file(output_file=json_path, rendered_file=log_file)
     
     with start_action(action_type="cli_run_all"):
-        # Step 1
-        typer.echo("\n" + "="*80)
-        typer.echo("STEP 1: Creating HGNC mapper")
-        typer.echo("="*80)
-        create_hgnc_mapper(output_dir)
-        typer.secho("✓ Step 1 complete\n", fg=typer.colors.GREEN)
+        # Step 1: Create HGNC mapper (optional)
+        mappers_path_final = mappers_path
+        if create_hgnc:
+            typer.echo("\n" + "="*80)
+            typer.echo("STEP 1: Creating HGNC mapper")
+            typer.echo("="*80)
+            try:
+                create_hgnc_mapper(output_dir)
+                typer.secho("✓ Step 1 complete\n", fg=typer.colors.GREEN)
+                mappers_path_final = output_dir / "hgnc_mappers.pkl"
+            except Exception as e:
+                typer.secho(f"⚠ Warning: Failed to create HGNC mapper: {e}", fg=typer.colors.YELLOW)
+                typer.echo("Will proceed without HGNC mapper (will use gene symbols from h5ad if available)\n")
+                mappers_path_final = None
+        elif mappers_path is None:
+            typer.echo("\n" + "="*80)
+            typer.echo("STEP 1: Skipping HGNC mapper creation (use --create-hgnc to create)")
+            typer.echo("="*80)
+            typer.echo("HGNC will only be used if needed (AnnData has Ensembl IDs without gene symbols)\n")
+            mappers_path_final = None
         
         # Step 2
         typer.echo("="*80)
         typer.echo("STEP 2: Converting h5ad to parquet")
         typer.echo("="*80)
-        mappers_path = output_dir / "hgnc_mappers.pkl"
         parquet_dir = output_dir / "temp_parquet"
         convert_h5ad_to_parquet(
-            h5ad_path, mappers_path, parquet_dir, chunk_size, top_genes,
+            h5ad_path, mappers_path_final, parquet_dir, chunk_size, top_genes,
             compression=compression, compression_level=compression_level, use_pyarrow=use_pyarrow
         )
         typer.secho("✓ Step 2 complete\n", fg=typer.colors.GREEN)
