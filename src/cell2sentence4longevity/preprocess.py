@@ -5,10 +5,11 @@ from typing import Optional
 import gc
 import shutil
 import re
+import sys
 
 import typer
-from eliot import start_action
-from pycomfort.logging import to_nice_file
+from eliot import start_action, to_file
+from pycomfort.logging import to_nice_file, to_nice_stdout
 from dotenv import load_dotenv
 
 from cell2sentence4longevity.preprocessing import (
@@ -118,6 +119,11 @@ def download(
         "-l",
         help="Path to eliot log file"
     ),
+    log_stdout: bool = typer.Option(
+        True,
+        "--log-stdout/--no-log-stdout",
+        help="Mirror Eliot logs to stdout"
+    ),
 ) -> None:
     """Download dataset from a URL.
     
@@ -128,6 +134,8 @@ def download(
         log_file.parent.mkdir(parents=True, exist_ok=True)
         json_path = log_file.with_suffix('.json')
         to_nice_file(output_file=json_path, rendered_file=log_file)
+    if log_stdout:
+        to_nice_stdout(output_file=json_path)
     
     with start_action(action_type="cli_download") as action:
         if force:
@@ -196,6 +204,11 @@ def upload(
         "-l",
         help="Path to eliot log file"
     ),
+    log_stdout: bool = typer.Option(
+        True,
+        "--log-stdout/--no-log-stdout",
+        help="Mirror Eliot logs to stdout"
+    ),
 ) -> None:
     """Upload to HuggingFace.
     
@@ -205,6 +218,8 @@ def upload(
         log_file.parent.mkdir(parents=True, exist_ok=True)
         json_path = log_file.with_suffix('.json')
         to_nice_file(output_file=json_path, rendered_file=log_file)
+    if log_stdout:
+        to_file(sys.stdout)
     
     with start_action(action_type="cli_upload") as action:
         typer.echo("Uploading to HuggingFace...")
@@ -296,7 +311,7 @@ def _process_single_file(
                 join_collection=join_collection
             )
             
-            print(f"  ✓ Conversion completed")
+            typer.echo("  ✓ Conversion completed")
             action.log(message_type="conversion_completed", dataset_name=dataset_name)
             
             # Force garbage collection to free memory
@@ -312,7 +327,7 @@ def _process_single_file(
             if repo_id and token:
                 # Upload to same repository as subfolder (dataset_name creates subfolder in repo)
                 action.log(message_type="upload_started", dataset_name=dataset_name, repo_id=repo_id, upload_dir=str(upload_dir))
-                print(f"  Uploading {dataset_name} to HuggingFace...")
+                typer.echo(f"  Uploading {dataset_name} to HuggingFace...")
                 files_uploaded = upload_to_huggingface(
                     data_splits_dir=upload_dir,
                     token=token,
@@ -321,9 +336,9 @@ def _process_single_file(
                 )
                 dataset_url = f"https://huggingface.co/datasets/{repo_id}"
                 if files_uploaded:
-                    print(f"  ✓ Upload completed: {dataset_url}")
+                    typer.echo(f"  ✓ Upload completed: {dataset_url}")
                 else:
-                    print(f"  ⚠ Upload returned False")
+                    typer.echo("  ⚠ Upload returned False")
                 action.log(message_type="upload_completed", dataset_name=dataset_name, repo_id=repo_id, dataset_url=dataset_url, files_uploaded=files_uploaded)
             
             # Final garbage collection
@@ -420,6 +435,11 @@ def run(
         "--log-dir",
         help="Directory for log files (separate log per file)"
     ),
+    log_stdout: bool = typer.Option(
+        True,
+        "--log-stdout/--no-log-stdout",
+        help="Mirror Eliot logs to stdout"
+    ),
     batch_mode: bool = typer.Option(
         False,
         "--batch-mode",
@@ -472,7 +492,10 @@ def run(
             global_log = log_dir / "pipeline.log"
         json_path = global_log.with_suffix('.json')
         to_nice_file(output_file=json_path, rendered_file=global_log)
-        print(f"Logging to: {global_log}")
+        to_nice_stdout(output_file=json_path)
+        typer.echo(f"Logging to: {global_log}")
+    if log_stdout:
+        to_file(sys.stdout)
     
     with start_action(action_type="cli_run", batch_mode=batch_mode) as action:
         # Validate output directory - prevent writing to data/test (reserved for code tests)
@@ -541,7 +564,7 @@ def run(
             # Check if output already exists and skip if flag is enabled
             if skip_existing and check_output_exists(output_dir, dataset_name, skip_train_test_split):
                 action.log(message_type="dataset_skipped", dataset_name=dataset_name, reason="output_already_exists", output_path=str(dataset_output_path))
-                print(f"  Skipping (output already exists)")
+                typer.echo("  Skipping (output already exists)")
                 skipped_datasets.append((dataset_name, dataset_output_path))
                 continue
             

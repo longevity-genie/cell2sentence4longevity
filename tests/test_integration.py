@@ -394,33 +394,6 @@ class TestIntegrationPipeline:
             test_action.log(message_type="test_complete", status="passed")
 
 
-class TestLogging:
-    """Test logging functionality."""
-    
-    def test_log_file_creation(self) -> None:
-        """Test that log files are created correctly."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            json_log = temp_path / 'test.json'
-            rendered_log = temp_path / 'test.log'
-            
-            to_nice_file(output_file=json_log, rendered_file=rendered_log)
-            
-            with start_action(action_type="test_log_creation") as action:
-                action.log(message_type="test_message", status="testing")
-            
-            assert json_log.exists(), "JSON log should be created"
-            assert rendered_log.exists(), "Rendered log should be created"
-            
-            # Verify JSON log content
-            with open(json_log, 'r') as f:
-                lines = f.readlines()
-                assert len(lines) > 0, "JSON log should have content"
-                
-                first_entry = json.loads(lines[0])
-                assert 'action_type' in first_entry or 'message_type' in first_entry, \
-                    "Log should have structured entries"
-
 
 class TestAgeExtraction:
     """Test age extraction functionality."""

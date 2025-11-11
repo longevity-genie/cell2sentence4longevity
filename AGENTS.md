@@ -33,7 +33,7 @@ This document outlines the coding standards and practices to follow when working
 ## Logging
 
 - **Eliot logging**: Use eliot as the default logging library using the `with start_action(...) as action` pattern
-- **Use log folder**: use to_nice_file(output_file=json_path, rendered_file=log_path) from pycomfort library (for which you also check exact syntax as you may have bad intuition on it) to add file destination for logging
+- **Use log folder**: use to_nice_file(output_file=json_path, rendered_file=log_path) and to_nice_stdout(output_file=json_path) from pycomfort library (for which you also check exact syntax as you may have bad intuition on it) to add file destination for logging
 
 ## CLI Development
 
