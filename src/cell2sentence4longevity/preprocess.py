@@ -296,6 +296,7 @@ def _process_single_file(
                 join_collection=join_collection
             )
             
+            print(f"  ✓ Conversion completed")
             action.log(message_type="conversion_completed", dataset_name=dataset_name)
             
             # Force garbage collection to free memory
@@ -311,6 +312,7 @@ def _process_single_file(
             if repo_id and token:
                 # Upload to same repository as subfolder (dataset_name creates subfolder in repo)
                 action.log(message_type="upload_started", dataset_name=dataset_name, repo_id=repo_id, upload_dir=str(upload_dir))
+                print(f"  Uploading {dataset_name} to HuggingFace...")
                 files_uploaded = upload_to_huggingface(
                     data_splits_dir=upload_dir,
                     token=token,
@@ -318,6 +320,10 @@ def _process_single_file(
                     dataset_name=dataset_name
                 )
                 dataset_url = f"https://huggingface.co/datasets/{repo_id}"
+                if files_uploaded:
+                    print(f"  ✓ Upload completed: {dataset_url}")
+                else:
+                    print(f"  ⚠ Upload returned False")
                 action.log(message_type="upload_completed", dataset_name=dataset_name, repo_id=repo_id, dataset_url=dataset_url, files_uploaded=files_uploaded)
             
             # Final garbage collection
@@ -455,6 +461,19 @@ def run(
     If --skip-train-test-split is used, the data will remain in a single parquet directory,
     allowing users on HuggingFace to decide on their own splitting strategy.
     """
+    # Setup logging once at the start (not per-file)
+    if log_dir:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if batch_mode:
+            # In batch mode, use a global log file
+            global_log = log_dir / "batch_pipeline.log"
+        else:
+            # In single file mode, use a simple pipeline log
+            global_log = log_dir / "pipeline.log"
+        json_path = global_log.with_suffix('.json')
+        to_nice_file(output_file=json_path, rendered_file=global_log)
+        print(f"Logging to: {global_log}")
+    
     with start_action(action_type="cli_run", batch_mode=batch_mode) as action:
         # Validate output directory - prevent writing to data/test (reserved for code tests)
         output_dir_resolved = output_dir.resolve()
@@ -522,15 +541,9 @@ def run(
             # Check if output already exists and skip if flag is enabled
             if skip_existing and check_output_exists(output_dir, dataset_name, skip_train_test_split):
                 action.log(message_type="dataset_skipped", dataset_name=dataset_name, reason="output_already_exists", output_path=str(dataset_output_path))
+                print(f"  Skipping (output already exists)")
                 skipped_datasets.append((dataset_name, dataset_output_path))
                 continue
-            
-            # Setup per-file logging
-            if log_dir:
-                file_log = log_dir / dataset_name / "pipeline.log"
-                file_log.parent.mkdir(parents=True, exist_ok=True)
-                json_path = file_log.with_suffix('.json')
-                to_nice_file(output_file=json_path, rendered_file=file_log)
             
             # Process the file
             success, message, processing_time, dataset_output_path = _process_single_file(

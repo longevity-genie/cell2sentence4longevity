@@ -276,6 +276,8 @@ def upload_to_huggingface(
             repo_paths=repo_paths[:10]  # Log first 10 paths as sample
         )
         
+        print(f"    Preparing to upload {total_files} files to {repo_id}...")
+        
         # Create a single commit with all operations (will overwrite existing files)
         with tqdm(total=1, desc=f'Uploading {dataset_name}') as pbar:
             commit_info = api.create_commit(
@@ -285,6 +287,8 @@ def upload_to_huggingface(
                 commit_message=f'Upload {total_files} data files for {dataset_name}'
             )
             pbar.update(1)
+        
+        print(f"    Commit URL: {commit_info.commit_url}")
         
         action.log(
             message_type="upload_complete",
