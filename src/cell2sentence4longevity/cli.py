@@ -77,7 +77,7 @@ def step2_convert_h5ad(
         help="Directory to save parquet chunks"
     ),
     chunk_size: int = typer.Option(
-        10000,
+        2500,
         "--chunk-size",
         "-c",
         help="Number of cells per chunk"
@@ -187,7 +187,7 @@ def step4_train_test_split(
         help="Random seed for reproducibility"
     ),
     chunk_size: int = typer.Option(
-        10000,
+        2500,
         "--chunk-size",
         "-c",
         help="Number of cells per output chunk"
@@ -290,7 +290,7 @@ def run_all(
         envvar="HF_TOKEN"
     ),
     chunk_size: int = typer.Option(
-        10000,
+        2500,
         "--chunk-size",
         "-c",
         help="Number of cells per chunk"

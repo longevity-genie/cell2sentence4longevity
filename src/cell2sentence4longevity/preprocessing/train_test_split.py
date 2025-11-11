@@ -85,14 +85,14 @@ def create_train_test_split(
         lazy_dataset = pl.scan_parquet(chunks_dir / "chunk_*.parquet")
         
         # Count total cells before filtering
-        total_cells_before = lazy_dataset.select(pl.count()).collect().item()
+        total_cells_before = lazy_dataset.select(pl.len()).collect().item()
         action.log(message_type="total_cells_before_filtering", count=total_cells_before)
         
         # Check for null ages
         null_age_count = (
             lazy_dataset
             .filter(pl.col('age').is_null())
-            .select(pl.count())
+            .select(pl.len())
             .collect()
             .item()
         )
@@ -126,7 +126,7 @@ def create_train_test_split(
         age_counts = (
             lazy_dataset
             .group_by('age')
-            .agg(pl.count().alias('count'))
+            .agg(pl.len().alias('count'))
             .sort('age')
             .collect()
         )
@@ -187,8 +187,8 @@ def create_train_test_split(
         )
         
         # Verify stratification
-        train_age_counts = train_df.group_by('age').agg(pl.count().alias('count')).sort('age')
-        test_age_counts = test_df.group_by('age').agg(pl.count().alias('count')).sort('age')
+        train_age_counts = train_df.group_by('age').agg(pl.len().alias('count')).sort('age')
+        test_age_counts = test_df.group_by('age').agg(pl.len().alias('count')).sort('age')
         action.log(
             message_type="train_age_distribution",
             distribution=train_age_counts.to_dicts()

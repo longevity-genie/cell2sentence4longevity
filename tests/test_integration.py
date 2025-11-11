@@ -214,8 +214,8 @@ class TestIntegrationPipeline:
             train_df = pl.scan_parquet(train_dir / "chunk_*.parquet")
             test_df = pl.scan_parquet(test_dir / "chunk_*.parquet")
             
-            train_count = train_df.select(pl.count()).collect().item()
-            test_count = test_df.select(pl.count()).collect().item()
+            train_count = train_df.select(pl.len()).collect().item()
+            test_count = test_df.select(pl.len()).collect().item()
             total_count = train_count + test_count
             
             test_ratio = test_count / total_count
@@ -420,18 +420,18 @@ class TestAgeExtraction:
         
         df = df.with_columns(
             pl.col('development_stage')
-            .map_elements(extract_age, return_dtype=pl.Int64)
+            .map_elements(extract_age, return_dtype=pl.Float64)
             .alias('age')
         )
         
         # Check dtype
-        assert df.schema['age'] == pl.Int64, "Age should be Int64"
+        assert df.schema['age'] == pl.Float64, "Age should be Float64"
         
         # Check values
-        assert df['age'].to_list() == [22, 45, 30], "Age values should be extracted correctly"
+        assert df['age'].to_list() == [22.0, 45.0, 30.0], "Age values should be extracted correctly"
         
         # Verify all ages are numeric
-        assert df['age'].dtype.is_integer(), "Age dtype should be integer"
+        assert df['age'].dtype.is_float(), "Age dtype should be float"
 
 
 if __name__ == "__main__":

@@ -8,22 +8,22 @@ from eliot import start_action
 from tqdm import tqdm
 
 
-def extract_age(development_stage: str | None) -> int | None:
-    """Extract age in years from development_stage string.
+def extract_age(development_stage: str | None) -> float | None:
+    """Extract age in years (float) from development_stage string.
     
     Args:
         development_stage: Development stage string (e.g., "22-year-old stage")
         
     Returns:
-        Age in years or None if not found
+        Age in years as float or None if not found
     """
     if development_stage is None:
         return None
     
-    # Match patterns like "22-year-old stage"
-    match = re.search(r'(\d+)-year-old', str(development_stage))
+    # Match patterns like "22-year-old stage" and allow decimals like "22.5-year-old"
+    match = re.search(r'(\d+(?:\.\d+)?)-year-old', str(development_stage))
     if match:
-        return int(match.group(1))
+        return float(match.group(1))
     return None
 
 
@@ -59,7 +59,7 @@ def add_age_and_cleanup(parquet_dir: Path) -> None:
         
         # Count total cells before processing
         lazy_dataset = pl.scan_parquet(chunks_dir / "chunk_*.parquet")
-        total_cells_before = lazy_dataset.select(pl.count()).collect().item()
+        total_cells_before = lazy_dataset.select(pl.len()).collect().item()
         action.log(message_type="total_cells_before_age_extraction", count=total_cells_before)
         
         if needs_age:
@@ -69,7 +69,7 @@ def add_age_and_cleanup(parquet_dir: Path) -> None:
                 # Load, transform, and collect
                 df_with_age = pl.scan_parquet(filepath).with_columns(
                     pl.col('development_stage')
-                    .map_elements(extract_age, return_dtype=pl.Int64)
+                    .map_elements(extract_age, return_dtype=pl.Float64)
                     .alias('age')
                 ).collect()
                 # Write back to same file
@@ -103,7 +103,7 @@ def add_age_and_cleanup(parquet_dir: Path) -> None:
             null_age_count = (
                 lazy_dataset
                 .filter(pl.col('age').is_null())
-                .select(pl.count())
+                .select(pl.len())
                 .collect()
                 .item()
             )
@@ -112,7 +112,7 @@ def add_age_and_cleanup(parquet_dir: Path) -> None:
             valid_age_count = (
                 lazy_dataset
                 .filter(pl.col('age').is_not_null())
-                .select(pl.count())
+                .select(pl.len())
                 .collect()
                 .item()
             )
@@ -147,7 +147,7 @@ def add_age_and_cleanup(parquet_dir: Path) -> None:
                 lazy_dataset
                 .filter(pl.col('age').is_not_null())
                 .group_by('age')
-                .agg(pl.count().alias('count'))
+                .agg(pl.len().alias('count'))
                 .sort('age')
                 .collect()
             )

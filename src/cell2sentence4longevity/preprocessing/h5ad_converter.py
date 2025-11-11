@@ -179,7 +179,7 @@ def convert_h5ad_to_parquet(
         mappers_path: Path to the HGNC mappers pickle file (optional)
         output_dir: Directory to save parquet chunks
         chunk_size: Number of cells per chunk (used if target_mb is None). Default: None (uses target_mb)
-        target_mb: Target size per chunk in MB (used if chunk_size is None). Default: None (uses chunk_size=10000)
+        target_mb: Target size per chunk in MB (used if chunk_size is None). Default: None (uses chunk_size=2500)
         dataset_name: Name of the dataset for folder organization. If None, uses h5ad filename stem
         top_genes: Number of top expressed genes per cell
         compression: Compression algorithm for parquet files. Options: "uncompressed", "snappy", 
@@ -196,8 +196,8 @@ def convert_h5ad_to_parquet(
     # Determine chunking strategy
     use_size_based = target_mb is not None
     if chunk_size is None and target_mb is None:
-        # Default to row-based with 10000 rows
-        chunk_size = 10000
+        # Default to row-based with 2500 rows (memory-friendly)
+        chunk_size = 2500
         use_size_based = False
     elif chunk_size is not None and target_mb is not None:
         # Both specified, prefer size-based
@@ -247,6 +247,15 @@ def convert_h5ad_to_parquet(
         # Get column names from obs once (outside loop)
         obs_columns = list(adata.obs.columns)
         
+        # Helper: ensure Polars-compatible arrays (convert pandas Categorical to string)
+        def _to_polars_compatible(values) -> np.ndarray:
+            # Pandas categorical exposes dtype.name == 'category' even without importing pandas explicitly
+            dtype_name = getattr(values, "dtype", None)
+            dtype_name = getattr(dtype_name, "name", None)
+            if dtype_name == "category":
+                return values.astype(str).to_numpy()
+            return values.to_numpy() if hasattr(values, "to_numpy") else np.asarray(values, dtype=object)
+        
         n_cells = adata.n_obs
         chunk_idx = 0
         current_chunk_rows = []
@@ -274,7 +283,8 @@ def convert_h5ad_to_parquet(
                 # Get metadata for batch
                 batch_obs_data = {}
                 for col in obs_columns:
-                    batch_obs_data[col] = adata.obs[col].iloc[cell_idx:batch_end].values
+                    series_slice = adata.obs[col].iloc[cell_idx:batch_end]
+                    batch_obs_data[col] = _to_polars_compatible(series_slice)
                 batch_obs_data['cell_sentence'] = batch_sentences
                 
                 # Add batch to current chunk
@@ -353,7 +363,8 @@ def convert_h5ad_to_parquet(
                     # Get metadata for this chunk
                     chunk_obs_data = {}
                     for col in obs_columns:
-                        chunk_obs_data[col] = adata.obs[col].iloc[start_idx:end_idx].values
+                        series_slice = adata.obs[col].iloc[start_idx:end_idx]
+                        chunk_obs_data[col] = _to_polars_compatible(series_slice)
                     
                     # Add cell_sentence column
                     chunk_obs_data['cell_sentence'] = cell_sentences

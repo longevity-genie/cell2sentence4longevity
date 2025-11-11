@@ -44,13 +44,47 @@ def download_dataset(
         
         # Check if file already exists and we're not forcing re-download
         if output_path.exists() and not force:
-            file_size = output_path.stat().st_size
-            action.log(
-                message_type="file_exists_skipping_download", 
-                path=str(output_path),
-                size_mb=file_size / (1024 * 1024)
-            )
-            return output_path
+            # Get expected file size from server to verify completeness
+            try:
+                head_response = requests.head(url, timeout=30, allow_redirects=True)
+                expected_size = int(head_response.headers.get('content-length', 0))
+                actual_size = output_path.stat().st_size
+                
+                # If expected size is available and matches, skip download
+                if expected_size > 0 and actual_size == expected_size:
+                    action.log(
+                        message_type="file_exists_skipping_download", 
+                        path=str(output_path),
+                        size_mb=actual_size / (1024 * 1024)
+                    )
+                    return output_path
+                elif expected_size > 0:
+                    # File is incomplete or different size
+                    action.log(
+                        message_type="file_incomplete_redownloading",
+                        path=str(output_path),
+                        actual_size_mb=actual_size / (1024 * 1024),
+                        expected_size_mb=expected_size / (1024 * 1024)
+                    )
+                else:
+                    # Can't verify size, assume file is complete if it exists
+                    action.log(
+                        message_type="file_exists_skipping_download", 
+                        path=str(output_path),
+                        size_mb=actual_size / (1024 * 1024),
+                        note="Could not verify file size"
+                    )
+                    return output_path
+            except Exception as e:
+                # If HEAD request fails, try to use existing file
+                actual_size = output_path.stat().st_size
+                action.log(
+                    message_type="file_exists_skipping_download_verification_failed",
+                    path=str(output_path),
+                    size_mb=actual_size / (1024 * 1024),
+                    error=str(e)
+                )
+                return output_path
         
         action.log(message_type="starting_download", filename=filename)
         
