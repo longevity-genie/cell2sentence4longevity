@@ -271,10 +271,6 @@ def _process_single_file(
     with start_action(action_type="process_single_file", dataset_name=dataset_name, h5ad_path=str(h5ad_path)) as action:
         try:
             # One-step conversion: h5ad -> cell sentences + age extraction -> train/test split -> output
-            typer.echo("="*80)
-            typer.echo(f"Processing: {dataset_name}")
-            typer.echo("Converting h5ad, extracting age, and creating train/test split in one pass")
-            typer.echo("="*80)
             action.log(
                 message_type="file_processing_started",
                 dataset_name=dataset_name,
@@ -300,7 +296,6 @@ def _process_single_file(
                 join_collection=join_collection
             )
             
-            typer.secho(f"✓ Conversion complete for {dataset_name}\n", fg=typer.colors.GREEN)
             action.log(message_type="conversion_completed", dataset_name=dataset_name)
             
             # Force garbage collection to free memory
@@ -314,9 +309,6 @@ def _process_single_file(
             
             # Upload to HuggingFace (optional)
             if repo_id and token:
-                typer.echo("="*80)
-                typer.echo(f"Uploading: {dataset_name} to HuggingFace")
-                typer.echo("="*80)
                 # Upload to same repository as subfolder (dataset_name creates subfolder in repo)
                 action.log(message_type="upload_started", dataset_name=dataset_name, repo_id=repo_id, upload_dir=str(upload_dir))
                 files_uploaded = upload_to_huggingface(
@@ -326,11 +318,6 @@ def _process_single_file(
                     dataset_name=dataset_name
                 )
                 dataset_url = f"https://huggingface.co/datasets/{repo_id}"
-                if files_uploaded:
-                    typer.secho(f"✓ Upload complete for {dataset_name}\n", fg=typer.colors.GREEN)
-                    typer.echo(f"Dataset: {dataset_url} (subfolder: {dataset_name})")
-                else:
-                    typer.echo(f"Dataset: {dataset_url} (subfolder: {dataset_name})")
                 action.log(message_type="upload_completed", dataset_name=dataset_name, repo_id=repo_id, dataset_url=dataset_url, files_uploaded=files_uploaded)
             
             # Final garbage collection
@@ -344,7 +331,6 @@ def _process_single_file(
             processing_time = time.time() - start_time
             error_msg = f"Failed to process {dataset_name}: {str(e)}"
             action.log(message_type="file_processing_error", dataset_name=dataset_name, error=str(e), processing_time_seconds=round(processing_time, 2))
-            typer.secho(f"✗ Error processing {dataset_name}: {e}", fg=typer.colors.RED)
             
             # Force garbage collection even on error
             gc.collect()
@@ -530,19 +516,11 @@ def run(
             dataset_output_path = output_dir / dataset_name
             
             if process_multiple:
-                # Visual separator for batch mode
-                typer.echo("\n" + "="*80)
-                typer.echo(f"  DATASET {idx}/{len(h5ad_files)}: {dataset_name}")
-                typer.echo("="*80 + "\n")
-            else:
-                typer.echo("\n" + "="*80)
-                typer.echo(f"Processing: {dataset_name}")
-                typer.echo("="*80)
+                # Progress indicator for batch mode
+                typer.echo(f"\n[{idx}/{len(h5ad_files)}] Processing: {dataset_name}")
             
             # Check if output already exists and skip if flag is enabled
             if skip_existing and check_output_exists(output_dir, dataset_name, skip_train_test_split):
-                typer.secho(f"⏭ Skipping {dataset_name}: output files already exist", fg=typer.colors.YELLOW)
-                typer.echo(f"  Output directory: {dataset_output_path}")
                 action.log(message_type="dataset_skipped", dataset_name=dataset_name, reason="output_already_exists", output_path=str(dataset_output_path))
                 skipped_datasets.append((dataset_name, dataset_output_path))
                 continue
@@ -574,20 +552,15 @@ def run(
             results.append((dataset_name, success, message, processing_time, dataset_output_path))
         
         # Summary
-        typer.echo("\n" + "="*80)
-        typer.secho("Pipeline Complete - Summary", fg=typer.colors.GREEN, bold=True)
-        typer.echo("="*80)
-        
         successful = sum(1 for _, success, _, _, _ in results if success)
         failed = len(results) - successful
         total_processed = len(results) + len(skipped_datasets)
         
-        typer.echo(f"Total files: {total_processed}")
-        typer.echo(f"Successful: {successful}")
+        typer.echo(f"\nProcessing complete: {successful}/{total_processed} successful")
         if failed > 0:
-            typer.echo(f"Failed: {failed}")
+            typer.echo(f"  Failed: {failed}")
         if skipped_datasets:
-            typer.echo(f"Skipped: {len(skipped_datasets)}")
+            typer.echo(f"  Skipped: {len(skipped_datasets)}")
         
         action.log(
             message_type="pipeline_summary",
@@ -601,23 +574,16 @@ def run(
             log_dir=str(log_dir) if log_dir else None
         )
         
-        typer.echo("\nDetails:")
-        # Show skipped datasets first
-        for dataset_name, dataset_output_path in skipped_datasets:
-            typer.secho(f"  ⏭ {dataset_name}: Skipped (output already exists)", fg=typer.colors.YELLOW)
-            typer.echo(f"    Output: {dataset_output_path}")
-        # Show processed datasets
-        for dataset_name, success, message, processing_time, _ in results:
-            status = "✓" if success else "✗"
-            color = typer.colors.GREEN if success else typer.colors.RED
-            typer.secho(f"  {status} {dataset_name}: {message}", fg=color)
+        # Show failed datasets if any
+        if failed > 0:
+            typer.echo("\nFailed datasets:")
+            for dataset_name, success, message, _, _ in results:
+                if not success:
+                    typer.echo(f"  ✗ {dataset_name}: {message}")
         
-        typer.echo(f"\nOutput directories:")
-        typer.echo(f"  Input: {input_dir}")
-        typer.echo(f"  Interim: {interim_dir}")
-        typer.echo(f"  Output: {output_dir}")
+        typer.echo(f"\nOutput: {output_dir}")
         if log_dir:
-            typer.echo(f"  Logs: {log_dir}")
+            typer.echo(f"Logs: {log_dir}")
         
         # Write summary TSV file if processing multiple files
         if process_multiple:
@@ -676,8 +642,7 @@ def run(
                     skipped=len(skipped_datasets)
                 )
                 
-                typer.echo(f"\n✓ Batch processing summary written to: {summary_file}")
-                typer.echo(f"  Summary contains timing and output paths for all processed datasets")
+                typer.echo(f"Summary: {summary_file}")
 
 
 def main() -> None:

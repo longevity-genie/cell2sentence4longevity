@@ -176,15 +176,13 @@ def upload_to_huggingface(
                     dataset_name=dataset_name,
                     has_train_test_split=has_train_test_split
                 )
-                typer.echo(f"⚠ Train chunks directory not found: {train_chunks_dir}")
-                typer.echo(f"  data_splits_dir: {data_splits_dir}")
-                typer.echo(f"  dataset_name: {dataset_name}")
             train_files = sorted(list(train_chunks_dir.glob("chunk_*.parquet"))) if train_chunks_dir and train_chunks_dir.exists() else []
             action.log(
                 message_type="train_files_search",
                 train_chunks_dir=str(train_chunks_dir) if train_chunks_dir else None,
                 train_chunks_dir_exists=train_chunks_dir.exists() if train_chunks_dir else False,
-                files_found=len(train_files)
+                files_found=len(train_files),
+                sample_files=[str(f) for f in train_files[:3]]
             )
             for filepath in train_files:
                 repo_path = f'{dataset_name}/train/{filepath.name}'
@@ -210,13 +208,13 @@ def upload_to_huggingface(
                     data_splits_dir=str(data_splits_dir),
                     dataset_name=dataset_name
                 )
-                typer.echo(f"⚠ Test chunks directory not found: {test_chunks_dir}")
             test_files = sorted(list(test_chunks_dir.glob("chunk_*.parquet"))) if test_chunks_dir and test_chunks_dir.exists() else []
             action.log(
                 message_type="test_files_search",
                 test_chunks_dir=str(test_chunks_dir) if test_chunks_dir else None,
                 test_chunks_dir_exists=test_chunks_dir.exists() if test_chunks_dir else False,
-                files_found=len(test_files)
+                files_found=len(test_files),
+                sample_files=[str(f) for f in test_files[:3]]
             )
             for filepath in test_files:
                 repo_path = f'{dataset_name}/test/{filepath.name}'
@@ -258,8 +256,15 @@ def upload_to_huggingface(
         
         # Upload all files in a single commit (always upload, even if files exist)
         if len(operations) == 0:
-            action.log(message_type="no_files_to_upload", dataset_name=dataset_name, repo_id=repo_id)
-            typer.echo(f"⚠ No files found to upload for {dataset_name}")
+            action.log(
+                message_type="no_files_to_upload", 
+                dataset_name=dataset_name, 
+                repo_id=repo_id,
+                data_splits_dir=str(data_splits_dir),
+                has_train_test_split=has_train_test_split,
+                train_chunks_dir=str(train_chunks_dir) if train_chunks_dir else None,
+                test_chunks_dir=str(test_chunks_dir) if test_chunks_dir else None
+            )
             return False
         
         # Log the paths that will be used in the repo
@@ -271,10 +276,8 @@ def upload_to_huggingface(
             repo_paths=repo_paths[:10]  # Log first 10 paths as sample
         )
         
-        typer.echo(f"Uploading {total_files} file(s) to {repo_id}/{dataset_name}/...")
-        
         # Create a single commit with all operations (will overwrite existing files)
-        with tqdm(total=1, desc='Uploading batch') as pbar:
+        with tqdm(total=1, desc=f'Uploading {dataset_name}') as pbar:
             commit_info = api.create_commit(
                 repo_id=repo_id,
                 repo_type='dataset',
@@ -290,7 +293,5 @@ def upload_to_huggingface(
             repo_id=repo_id,
             dataset_name=dataset_name
         )
-        typer.echo(f"✓ Successfully uploaded {total_files} file(s)")
-        typer.echo(f"  Commit: {commit_info.commit_url}")
         return True
 
