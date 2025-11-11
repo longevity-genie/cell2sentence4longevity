@@ -12,7 +12,6 @@ from pycomfort.logging import to_nice_file
 from dotenv import load_dotenv
 
 from cell2sentence4longevity.preprocessing import (
-    create_hgnc_mapper,
     convert_h5ad_to_train_test,
     upload_to_huggingface,
     download_dataset,
@@ -166,40 +165,6 @@ def cleanup(
 
 
 @app.command()
-def hgnc_mapper(
-    interim_dir: Path = typer.Option(
-        Path("./data/interim"),
-        "--interim-dir",
-        "-i",
-        help="Directory to save interim files (HGNC mappers)"
-    ),
-    log_file: Optional[Path] = typer.Option(
-        None,
-        "--log-file",
-        "-l",
-        help="Path to eliot log file"
-    ),
-) -> None:
-    """Create HGNC gene mapper.
-    
-    Downloads official gene mappings from HGNC to convert Ensembl IDs to gene symbols.
-    """
-    if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        json_path = log_file.with_suffix('.json')
-        to_nice_file(output_file=json_path, rendered_file=log_file)
-    
-    with start_action(action_type="cli_hgnc_mapper") as action:
-        typer.echo("Creating HGNC mapper...")
-        action.log(message_type="hgnc_mapper_creation_started", interim_dir=str(interim_dir))
-        create_hgnc_mapper(interim_dir)
-        mapper_path = interim_dir / 'hgnc_mappers.pkl'
-        typer.secho("✓ HGNC mapper created successfully", fg=typer.colors.GREEN)
-        typer.echo(f"Output: {mapper_path}")
-        action.log(message_type="hgnc_mapper_creation_completed", output_path=str(mapper_path))
-
-
-@app.command()
 def upload(
     output_dir: Path = typer.Option(
         Path("./data/output"),
@@ -270,8 +235,6 @@ def _process_single_file(
     skip_train_test_split: bool,
     repo_id: Optional[str],
     token: Optional[str],
-    mappers_path: Path | None,
-    keep_interim: bool = False,
     join_collection: bool = True,
 ) -> tuple[bool, str, float, Path]:
     """Process a single h5ad file through the entire pipeline.
@@ -296,9 +259,6 @@ def _process_single_file(
         skip_train_test_split: Whether to skip train/test split
         repo_id: HuggingFace repository ID
         token: HuggingFace token
-        mappers_path: Path to HGNC mappers
-        keep_interim: Whether to keep interim files (unused in one-step approach)
-        
     Returns:
         Tuple of (success: bool, message: str, processing_time_seconds: float, dataset_output_dir: Path)
     """
@@ -326,7 +286,6 @@ def _process_single_file(
             
             convert_h5ad_to_train_test(
                 h5ad_path=h5ad_path,
-                mappers_path=mappers_path,
                 output_dir=output_dir,
                 dataset_name=dataset_name,
                 chunk_size=chunk_size,
@@ -474,22 +433,6 @@ def run(
         "--batch-mode",
         help="Process all h5ad files in input directory (default: False, process single file)"
     ),
-    keep_interim: bool = typer.Option(
-        False,
-        "--keep-interim",
-        help="Keep interim parquet files after processing (default: False, clean up to save space)"
-    ),
-    mappers_path: Path | None = typer.Option(
-        None,
-        "--mappers",
-        "-m",
-        help="Path to HGNC mappers pickle file (optional, only created/used if needed or explicitly provided)"
-    ),
-    create_hgnc: bool = typer.Option(
-        False,
-        "--create-hgnc",
-        help="Force creation of HGNC mapper (default: False, only created if needed)"
-    ),
     skip_existing: bool = typer.Option(
         False,
         "--skip-existing",
@@ -504,14 +447,13 @@ def run(
     """Run the preprocessing pipeline.
     
     One-step streaming approach that processes each h5ad file in a single pass:
-    1. Create HGNC mapper (optional, only if --create-hgnc or if needed)
-    2. One-step conversion per file:
+    1. One-step conversion per file:
        - Read h5ad chunks
        - Create cell sentences
        - Extract age from development_stage
        - Split into train/test (if not skipped)
        - Write directly to output
-    3. Upload to HuggingFace (per file, if repo_id and token provided)
+    2. Upload to HuggingFace (per file, if repo_id and token provided)
     
     Memory Management:
     - No interim files are created (everything happens in one streaming pass)
@@ -527,7 +469,7 @@ def run(
     If --skip-train-test-split is used, the data will remain in a single parquet directory,
     allowing users on HuggingFace to decide on their own splitting strategy.
     """
-    with start_action(action_type="cli_run", batch_mode=batch_mode, keep_interim=keep_interim) as action:
+    with start_action(action_type="cli_run", batch_mode=batch_mode) as action:
         # Validate output directory - prevent writing to data/test (reserved for code tests)
         output_dir_resolved = output_dir.resolve()
         test_dir_resolved = Path("./data/test").resolve()
@@ -579,31 +521,6 @@ def run(
         # Decide batch vs single mode
         process_multiple = batch_mode or len(h5ad_files) > 1
         
-        # Create HGNC mapper (optional, only if requested or if mappers_path not provided)
-        mappers_path_final = mappers_path
-        if create_hgnc:
-            typer.echo("\n" + "="*80)
-            typer.echo("Creating HGNC mapper")
-            typer.echo("="*80)
-            action.log(message_type="hgnc_mapper_creation_requested", interim_dir=str(interim_dir))
-            try:
-                create_hgnc_mapper(interim_dir)
-                typer.secho("✓ HGNC mapper created\n", fg=typer.colors.GREEN)
-                mappers_path_final = interim_dir / "hgnc_mappers.pkl"
-                action.log(message_type="hgnc_mapper_created", mappers_path=str(mappers_path_final))
-            except Exception as e:
-                typer.secho(f"⚠ Warning: Failed to create HGNC mapper: {e}", fg=typer.colors.YELLOW)
-                typer.echo("Will proceed without HGNC mapper (will use gene symbols from h5ad if available)\n")
-                action.log(message_type="hgnc_mapper_creation_failed", error=str(e))
-                mappers_path_final = None
-        elif mappers_path is None:
-            typer.echo("\n" + "="*80)
-            typer.echo("Skipping HGNC mapper creation (use --create-hgnc to create)")
-            typer.echo("="*80)
-            typer.echo("HGNC will only be used if needed (AnnData has Ensembl IDs without gene symbols)\n")
-            action.log(message_type="hgnc_mapper_skipped", reason="not_requested_and_no_path_provided")
-            mappers_path_final = None
-        
         # Process files
         results: list[tuple[str, bool, str, float, Path]] = []
         skipped_datasets: list[tuple[str, Path]] = []
@@ -612,12 +529,15 @@ def run(
             dataset_name = sanitize_dataset_name(h5ad_file.stem)
             dataset_output_path = output_dir / dataset_name
             
-            typer.echo("\n" + "="*80)
             if process_multiple:
-                typer.echo(f"Processing file {idx}/{len(h5ad_files)}: {dataset_name}")
+                # Visual separator for batch mode
+                typer.echo("\n" + "="*80)
+                typer.echo(f"  DATASET {idx}/{len(h5ad_files)}: {dataset_name}")
+                typer.echo("="*80 + "\n")
             else:
+                typer.echo("\n" + "="*80)
                 typer.echo(f"Processing: {dataset_name}")
-            typer.echo("="*80)
+                typer.echo("="*80)
             
             # Check if output already exists and skip if flag is enabled
             if skip_existing and check_output_exists(output_dir, dataset_name, skip_train_test_split):
@@ -648,8 +568,6 @@ def run(
                 skip_train_test_split=skip_train_test_split,
                 repo_id=repo_id,
                 token=token,
-                mappers_path=mappers_path_final,
-                keep_interim=keep_interim,
                 join_collection=lookup_publication,
             )
             

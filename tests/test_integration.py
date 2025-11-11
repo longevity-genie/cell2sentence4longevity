@@ -13,7 +13,6 @@ from pycomfort.logging import to_nice_file
 
 from cell2sentence4longevity.preprocessing import (
     convert_h5ad_to_train_test,
-    create_hgnc_mapper,
     download_dataset,
 )
 
@@ -119,32 +118,14 @@ class TestIntegrationPipeline:
                 size_mb=h5ad_path.stat().st_size / 1024 / 1024
             )
             
-            # Step 1: Create HGNC mapper (optional - skip if download fails)
-            test_action.log(message_type="test_step", step=1, description="Creating HGNC mapper (optional)")
-            # HGNC mappers are now stored in shared directory as parquet
-            shared_dir = Path("./data/shared")
-            mappers_path = shared_dir / 'hgnc_mappers.parquet'
-            try:
-                create_hgnc_mapper(shared_dir)
-                assert mappers_path.exists(), "HGNC mappers file should exist"
-                test_action.log(message_type="hgnc_mapper_created", path=str(mappers_path))
-            except RuntimeError as e:
-                test_action.log(
-                    message_type="hgnc_mapper_creation_failed", 
-                    error=str(e),
-                    fallback="Will use feature_name from h5ad"
-                )
-                mappers_path = None
-            
-            # Step 2: One-step conversion (h5ad -> cell sentences + age extraction -> train/test split -> output)
-            test_action.log(message_type="test_step", step=2, description="One-step conversion with train/test split")
+            # Step 1: One-step conversion (h5ad -> cell sentences + age extraction -> train/test split -> output)
+            test_action.log(message_type="test_step", step=1, description="One-step conversion with train/test split")
             
             # Extract dataset name from h5ad path
             dataset_name = h5ad_path.stem
             
             convert_h5ad_to_train_test(
                 h5ad_path=h5ad_path,
-                mappers_path=mappers_path,
                 output_dir=temp_dirs['output'],
                 dataset_name=dataset_name,
                 chunk_size=10000,
@@ -401,8 +382,8 @@ class TestIntegrationPipeline:
             # Validate specific log actions were recorded
             log_content = '\n'.join(log_lines)
             assert 'download_dataset' in log_content, "Should log download action"
-            assert 'create_hgnc_mapper' in log_content or 'hgnc' in log_content.lower(), \
-                "Should log HGNC mapper creation"
+            assert 'hgnc' in log_content.lower(), \
+                "Should log HGNC usage"
             assert 'convert_h5ad_to_train_test' in log_content or 'h5ad' in log_content.lower(), \
                 "Should log h5ad conversion"
             assert 'age' in log_content.lower(), \
@@ -583,22 +564,8 @@ class TestBatchProcessing:
             
             test_action.log(message_type="datasets_downloaded", count=len(h5ad_files))
             
-            # Create HGNC mapper (optional)
-            test_action.log(message_type="test_step", step=1, description="Creating HGNC mapper")
-            from cell2sentence4longevity.preprocessing import create_hgnc_mapper
-            
-            # HGNC mappers are now stored in shared directory as parquet
-            shared_dir = Path("./data/shared")
-            mappers_path = shared_dir / 'hgnc_mappers.parquet'
-            try:
-                create_hgnc_mapper(shared_dir)
-                test_action.log(message_type="hgnc_mapper_created", path=str(mappers_path))
-            except RuntimeError as e:
-                test_action.log(message_type="hgnc_mapper_creation_failed", error=str(e))
-                mappers_path = None
-            
             # Process files in batch
-            test_action.log(message_type="test_step", step=2, description="Batch processing files")
+            test_action.log(message_type="test_step", step=1, description="Batch processing files")
             
             results: list[tuple[str, bool, str, float, Path]] = []
             
@@ -632,7 +599,6 @@ class TestBatchProcessing:
                     skip_train_test_split=False,
                     repo_id=None,
                     token=None,
-                    mappers_path=mappers_path,
                     keep_interim=False,
                 )
                 
@@ -775,16 +741,6 @@ class TestBatchProcessing:
             h5ad_path = download_dataset(url=url, output_dir=batch_temp_dirs['input'])
             dataset_name = sanitize_dataset_name(h5ad_path.stem)
             
-            # Create HGNC mapper
-            from cell2sentence4longevity.preprocessing import create_hgnc_mapper
-            # HGNC mappers are now stored in shared directory as parquet
-            shared_dir = Path("./data/shared")
-            mappers_path = shared_dir / 'hgnc_mappers.parquet'
-            try:
-                create_hgnc_mapper(shared_dir)
-            except RuntimeError:
-                mappers_path = None
-            
             # Process the file once
             test_action.log(message_type="test_step", step=1, description="Processing file first time")
             
@@ -801,7 +757,6 @@ class TestBatchProcessing:
                 skip_train_test_split=False,
                 repo_id=None,
                 token=None,
-                mappers_path=mappers_path,
                 keep_interim=False,
             )
             
@@ -860,16 +815,6 @@ class TestBatchProcessing:
             url = "https://datasets.cellxgene.cziscience.com/10cc50a0-af80-4fa1-b668-893dd5c0113a.h5ad"
             h5ad_path = download_dataset(url=url, output_dir=batch_temp_dirs['input'])
             
-            # Create HGNC mapper
-            from cell2sentence4longevity.preprocessing import create_hgnc_mapper
-            # HGNC mappers are now stored in shared directory as parquet
-            shared_dir = Path("./data/shared")
-            mappers_path = shared_dir / 'hgnc_mappers.parquet'
-            try:
-                create_hgnc_mapper(shared_dir)
-            except RuntimeError:
-                mappers_path = None
-            
             memory_before = process.memory_info().rss / 1024 / 1024  # MB
             test_action.log(message_type="memory_before_processing", memory_mb=memory_before)
             
@@ -887,7 +832,6 @@ class TestBatchProcessing:
                 skip_train_test_split=False,
                 repo_id=None,
                 token=None,
-                mappers_path=mappers_path,
                 keep_interim=False,
             )
             

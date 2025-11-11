@@ -14,8 +14,6 @@ from eliot import start_action
 from tqdm import tqdm
 import polars as pl
 
-from cell2sentence4longevity.preprocessing.hgnc_mapper import create_hgnc_mapper, load_mappers
-
 
 def extract_age_column(df: pl.DataFrame, source_col: str = 'development_stage') -> pl.DataFrame:
     """Extract age in years from development_stage column using Polars regex.
@@ -348,7 +346,6 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
 
 def convert_h5ad_to_parquet(
     h5ad_path: Path,
-    mappers_path: Path | None = None,
     output_dir: Path = Path("./output"),
     chunk_size: int | None = None,
     target_mb: float | None = None,
@@ -362,7 +359,6 @@ def convert_h5ad_to_parquet(
     
     Args:
         h5ad_path: Path to the h5ad file
-        mappers_path: Path to the HGNC mappers pickle file (optional)
         output_dir: Directory to save parquet chunks
         chunk_size: Number of cells per chunk (used if target_mb is None). Default: None (uses target_mb)
         target_mb: Target size per chunk in MB (used if chunk_size is None). Default: None (uses chunk_size=2500)
@@ -406,20 +402,14 @@ def convert_h5ad_to_parquet(
         
         # Determine if we need HGNC mapping
         # Use HGNC if:
-        # 1. User explicitly provided mappers_path, OR
-        # 2. AnnData doesn't have gene symbols in var_names AND feature_name doesn't have them either
+        # AnnData doesn't have gene symbols in var_names AND feature_name doesn't have them either
         has_symbols = has_gene_symbols(adata)
         feature_has_symbols = feature_name_has_gene_symbols(adata)
-        user_provided_mappers = mappers_path is not None and mappers_path.exists()
-        
-        # Need HGNC if: user provided mappers OR (no gene symbols in var_names AND no gene symbols in feature_name)
-        needs_hgnc = user_provided_mappers or (not has_symbols and not feature_has_symbols)
         
         action.log(
             message_type="hgnc_usage_decision",
             has_gene_symbols=has_symbols,
             feature_name_has_gene_symbols=feature_has_symbols,
-            user_provided_mappers=user_provided_mappers,
             has_feature_name='feature_name' in adata.var.columns,
             will_use_hgnc=True
         )
@@ -636,7 +626,6 @@ def convert_h5ad_to_parquet(
 
 def convert_h5ad_to_train_test(
     h5ad_path: Path,
-    mappers_path: Path | None = None,
     output_dir: Path = Path("./output"),
     dataset_name: str | None = None,
     chunk_size: int = 10000,
@@ -664,13 +653,12 @@ def convert_h5ad_to_train_test(
     
     Collection joining behavior:
     - By default (join_collection=True), auto-detects if dataset is from CellxGene (by UUID pattern or URL)
-    - If detected, checks if dataset_id exists in collections cache
-    - Only adds dataset_id column if dataset is found in collections
-    - If join_collection=False, skips collection joining entirely
+    - If detected, always adds dataset_id column (regardless of whether dataset is in collections cache)
+    - Only joins with collections metadata if dataset is found in collections cache
+    - If join_collection=False, skips collection joining entirely and does not add dataset_id column
     
     Args:
         h5ad_path: Path to the h5ad file
-        mappers_path: Path to the HGNC mappers pickle file (optional)
         output_dir: Directory to save train/test splits
         dataset_name: Name of the dataset for folder organization. If None, uses h5ad filename stem
         chunk_size: Number of cells per chunk
@@ -682,7 +670,7 @@ def convert_h5ad_to_train_test(
         use_pyarrow: Use pyarrow backend for parquet writes
         skip_train_test_split: If True, writes all data to output_dir without splitting
         stratify_by_age: If True, maintains age distribution in train/test splits (default: True)
-        join_collection: If True (default), auto-detects cellxgene datasets and adds dataset_id column if found in collections. If False, skips collection joining.
+        join_collection: If True (default), auto-detects cellxgene datasets and always adds dataset_id column. Only joins with collections metadata if dataset is found in collections cache. If False, skips collection joining and does not add dataset_id column.
     """
     start_time = time.time()
     
@@ -710,16 +698,11 @@ def convert_h5ad_to_train_test(
         # Determine if we need HGNC mapping
         has_symbols = has_gene_symbols(adata)
         feature_has_symbols = feature_name_has_gene_symbols(adata)
-        user_provided_mappers = mappers_path is not None and mappers_path.exists()
-        
-        # Need HGNC if: user provided mappers OR (no gene symbols in var_names AND no gene symbols in feature_name)
-        needs_hgnc = user_provided_mappers or (not has_symbols and not feature_has_symbols)
         
         action.log(
             message_type="hgnc_usage_decision",
             has_gene_symbols=has_symbols,
             feature_name_has_gene_symbols=feature_has_symbols,
-            user_provided_mappers=user_provided_mappers,
             has_feature_name='feature_name' in adata.var.columns,
             will_use_hgnc=True
         )
@@ -783,7 +766,7 @@ def convert_h5ad_to_train_test(
         dataset_id = None
         
         if join_collection:
-            # Auto-detect: check if it's a cellxgene dataset and if it exists in collections
+            # Auto-detect: check if it's a cellxgene dataset
             from cell2sentence4longevity.preprocessing.publication_lookup import (
                 is_cellxgene_dataset,
                 extract_dataset_id_from_path,
@@ -792,29 +775,45 @@ def convert_h5ad_to_train_test(
             )
             if is_cellxgene_dataset(h5ad_path):
                 dataset_id = extract_dataset_id_from_path(h5ad_path)
-                if dataset_id_exists_in_collections(dataset_id, cache_dir=None):
-                    should_add_dataset_id = True
+                # Always add dataset_id column for cellxgene datasets
+                should_add_dataset_id = True
+                
+                # Only join with collections if dataset exists in collections cache
+                found_in_collections = dataset_id_exists_in_collections(dataset_id, cache_dir=None)
+                if found_in_collections:
                     should_join_collections = True
                     action.log(
-                        message_type="auto_detected_cellxgene_dataset",
+                        message_type="dataset_id_found_in_collections",
                         dataset_id=dataset_id,
+                        found_in_collections=True,
+                        will_add_dataset_id=True,
+                        will_join_collections=True,
                         note="Auto-detected cellxgene dataset found in collections, will add dataset_id column and join with collections"
                     )
                 else:
                     action.log(
-                        message_type="cellxgene_dataset_not_in_collections",
+                        message_type="dataset_id_not_found_in_collections",
                         dataset_id=dataset_id,
-                        note="Auto-detected cellxgene dataset but not found in collections, skipping dataset_id column"
+                        found_in_collections=False,
+                        will_add_dataset_id=True,
+                        will_join_collections=False,
+                        note="Auto-detected cellxgene dataset but not found in collections, will add dataset_id column but skip collection join"
                     )
             else:
                 action.log(
                     message_type="not_cellxgene_dataset",
+                    found_in_collections=False,
+                    will_add_dataset_id=False,
+                    will_join_collections=False,
                     note="Dataset does not appear to be from cellxgene, skipping dataset_id column"
                 )
         else:
             action.log(
                 message_type="join_collection_disabled",
-                note="join_collection=False, skipping collection joining"
+                found_in_collections=False,
+                will_add_dataset_id=False,
+                will_join_collections=False,
+                note="join_collection=False, skipping collection joining and dataset_id column"
             )
         
         # Get column names from obs once (outside loop)

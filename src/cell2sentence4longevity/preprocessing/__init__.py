@@ -1,6 +1,6 @@
 """Preprocessing pipeline for AIDA cell sentence dataset."""
 
-from cell2sentence4longevity.preprocessing.hgnc_mapper import create_hgnc_mapper
+from cell2sentence4longevity.preprocessing.hgnc_mapper import get_hgnc_data
 from cell2sentence4longevity.preprocessing.h5ad_converter import (
     convert_h5ad_to_parquet,
     convert_h5ad_to_train_test,
@@ -17,7 +17,7 @@ from cell2sentence4longevity.preprocessing.publication_lookup import (
 )
 
 __all__ = [
-    "create_hgnc_mapper",
+    "get_hgnc_data",
     "convert_h5ad_to_parquet",
     "convert_h5ad_to_train_test",
     "create_train_test_split",
