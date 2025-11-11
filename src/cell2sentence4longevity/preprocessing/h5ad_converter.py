@@ -333,8 +333,8 @@ def convert_h5ad_to_parquet(
         # Convert to numpy array for faster indexing
         gene_symbols = np.array(gene_symbols_list, dtype=object)
         
-        # Create output directory structure: output_dir/dataset_name/chunks/
-        chunks_dir = output_dir / dataset_name / "chunks"
+        # Create output directory structure: output_dir/dataset_name/
+        chunks_dir = output_dir / dataset_name
         chunks_dir.mkdir(parents=True, exist_ok=True)
         action.log(message_type="output_directory_created", chunks_dir=str(chunks_dir))
         

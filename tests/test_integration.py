@@ -140,7 +140,8 @@ class TestIntegrationPipeline:
             )
             
             # Validate parquet conversion
-            parquet_files = list(parquet_dir.glob("chunk_*.parquet"))
+            # Files are in parquet_dir/dataset_name/chunk_*.parquet structure
+            parquet_files = list(parquet_dir.glob("*/chunk_*.parquet"))
             assert len(parquet_files) > 0, "Should have created parquet files"
             test_action.log(message_type="parquet_chunks_created", count=len(parquet_files))
             
@@ -156,7 +157,9 @@ class TestIntegrationPipeline:
             
             # Step 3: Add age and cleanup
             test_action.log(message_type="test_step", step=3, description="Adding age and cleaning up")
-            add_age_and_cleanup(parquet_dir)
+            # add_age_and_cleanup works on the dataset directory (parquet_dir/dataset_name)
+            dataset_dir = list(parquet_dir.glob("*"))[0]  # Get the dataset directory
+            add_age_and_cleanup(dataset_dir)
             
             # Validate age column was added
             sample_df_after_age = pl.read_parquet(parquet_files[0])
@@ -183,8 +186,9 @@ class TestIntegrationPipeline:
             
             # Step 4: Create train/test split
             test_action.log(message_type="test_step", step=4, description="Creating train/test split")
+            # create_train_test_split works on the dataset directory (parquet_dir/dataset_name)
             create_train_test_split(
-                parquet_dir=parquet_dir,
+                parquet_dir=dataset_dir,
                 output_dir=temp_dirs['output'],
                 test_size=0.05,
                 random_state=42,
@@ -319,7 +323,8 @@ class TestIntegrationPipeline:
             )
             
             # Verify chunks are approximately the right size
-            parquet_files = list(parquet_dir.glob("chunk_*.parquet"))
+            # Files are in parquet_dir/dataset_name/chunk_*.parquet structure
+            parquet_files = list(parquet_dir.glob("*/chunk_*.parquet"))
             assert len(parquet_files) > 0
             
             # Check chunk sizes
@@ -336,10 +341,12 @@ class TestIntegrationPipeline:
             )
             
             # Continue with rest of pipeline
-            add_age_and_cleanup(parquet_dir)
+            # Get the dataset directory for downstream processing
+            dataset_dir = list(parquet_dir.glob("*"))[0]
+            add_age_and_cleanup(dataset_dir)
             
             create_train_test_split(
-                parquet_dir=parquet_dir,
+                parquet_dir=dataset_dir,
                 output_dir=temp_dirs['output'],
                 test_size=0.1,
                 random_state=42,
