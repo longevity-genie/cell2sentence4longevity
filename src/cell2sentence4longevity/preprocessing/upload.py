@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import List, Tuple
 
+import typer
 from huggingface_hub import HfApi, login, CommitOperationAdd
 from eliot import start_action
 from tqdm import tqdm
@@ -17,7 +18,7 @@ def upload_to_huggingface(
     repo_id: str = DEFAULT_REPO_ID,
     dataset_name: str | None = None,
     readme_path: Path | None = None
-) -> None:
+) -> bool:
     """Upload data to HuggingFace hub in a single commit.
     
     Handles two cases:
@@ -140,16 +141,11 @@ def upload_to_huggingface(
         )
         action.log(message_type="repo_ready")
         
-        # Check existing files
-        action.log(message_type="checking_existing_files")
-        existing_files = set(api.list_repo_files(repo_id, repo_type='dataset'))
-        action.log(message_type="found_existing_files", count=len(existing_files))
-        
         # Prepare operations list for batch commit
         operations: List[CommitOperationAdd] = []
         
-        # Add README if provided and not exists
-        if readme_path is not None and readme_path.exists() and 'README.md' not in existing_files:
+        # Add README if provided
+        if readme_path is not None and readme_path.exists():
             action.log(message_type="adding_readme_to_commit")
             operations.append(
                 CommitOperationAdd(
@@ -160,101 +156,99 @@ def upload_to_huggingface(
         
         if has_train_test_split:
             # Handle train/test split case
-            # Prepare train files
+            # Prepare train files - upload all files regardless of existing status
             train_files = sorted(list(train_chunks_dir.glob("chunk_*.parquet"))) if train_chunks_dir.exists() else []
-            train_to_upload = []
             for filepath in train_files:
                 repo_path = f'{dataset_name}/train/{filepath.name}'
-                if repo_path not in existing_files:
-                    train_to_upload.append(filepath)
-                    operations.append(
-                        CommitOperationAdd(
-                            path_in_repo=repo_path,
-                            path_or_fileobj=str(filepath)
-                        )
+                operations.append(
+                    CommitOperationAdd(
+                        path_in_repo=repo_path,
+                        path_or_fileobj=str(filepath)
                     )
+                )
             
             action.log(
                 message_type="train_files_prepared",
                 total=len(train_files),
-                to_upload=len(train_to_upload),
+                to_upload=len(train_files),
                 train_chunks_dir=str(train_chunks_dir)
             )
             
-            # Prepare test files
+            # Prepare test files - upload all files regardless of existing status
             test_files = sorted(list(test_chunks_dir.glob("chunk_*.parquet"))) if test_chunks_dir.exists() else []
-            test_to_upload = []
             for filepath in test_files:
                 repo_path = f'{dataset_name}/test/{filepath.name}'
-                if repo_path not in existing_files:
-                    test_to_upload.append(filepath)
-                    operations.append(
-                        CommitOperationAdd(
-                            path_in_repo=repo_path,
-                            path_or_fileobj=str(filepath)
-                        )
+                operations.append(
+                    CommitOperationAdd(
+                        path_in_repo=repo_path,
+                        path_or_fileobj=str(filepath)
                     )
+                )
             
             action.log(
                 message_type="test_files_prepared",
                 total=len(test_files),
-                to_upload=len(test_to_upload),
+                to_upload=len(test_files),
                 test_chunks_dir=str(test_chunks_dir)
             )
             
-            total_files = len(train_to_upload) + len(test_to_upload)
+            total_files = len(train_files) + len(test_files)
         else:
-            # Handle single dataset case (no split)
+            # Handle single dataset case (no split) - upload all files regardless of existing status
             single_files = sorted(list(single_chunks_dir.glob("chunk_*.parquet"))) if single_chunks_dir.exists() else []
-            files_to_upload = []
             for filepath in single_files:
                 repo_path = f'{dataset_name}/{filepath.name}'
-                if repo_path not in existing_files:
-                    files_to_upload.append(filepath)
-                    operations.append(
-                        CommitOperationAdd(
-                            path_in_repo=repo_path,
-                            path_or_fileobj=str(filepath)
-                        )
+                operations.append(
+                    CommitOperationAdd(
+                        path_in_repo=repo_path,
+                        path_or_fileobj=str(filepath)
                     )
+                )
             
             action.log(
                 message_type="single_dataset_files_prepared",
                 total=len(single_files),
-                to_upload=len(files_to_upload),
+                to_upload=len(single_files),
                 single_chunks_dir=str(single_chunks_dir)
             )
             
-            total_files = len(files_to_upload)
+            total_files = len(single_files)
         
-        # Upload all files in a single commit
+        # Upload all files in a single commit (always upload, even if files exist)
         if len(operations) == 0:
-            action.log(message_type="no_files_to_upload")
-        else:
-            # Log the paths that will be used in the repo
-            repo_paths = [op.path_in_repo for op in operations]
-            action.log(
-                message_type="starting_batch_upload", 
-                total_operations=len(operations),
-                total_files=total_files,
-                repo_paths=repo_paths[:10]  # Log first 10 paths as sample
-            )
-            
-            # Create a single commit with all operations
-            with tqdm(total=1, desc='Uploading batch') as pbar:
-                commit_info = api.create_commit(
-                    repo_id=repo_id,
-                    repo_type='dataset',
-                    operations=operations,
-                    commit_message=f'Upload {total_files} data files for {dataset_name}'
-                )
-                pbar.update(1)
-            
-            action.log(
-                message_type="upload_complete",
-                commit_url=commit_info.commit_url,
-                total_operations=len(operations),
+            action.log(message_type="no_files_to_upload", dataset_name=dataset_name, repo_id=repo_id)
+            typer.echo(f"⚠ No files found to upload for {dataset_name}")
+            return False
+        
+        # Log the paths that will be used in the repo
+        repo_paths = [op.path_in_repo for op in operations]
+        action.log(
+            message_type="starting_batch_upload", 
+            total_operations=len(operations),
+            total_files=total_files,
+            repo_paths=repo_paths[:10]  # Log first 10 paths as sample
+        )
+        
+        typer.echo(f"Uploading {total_files} file(s) to {repo_id}/{dataset_name}/...")
+        
+        # Create a single commit with all operations (will overwrite existing files)
+        with tqdm(total=1, desc='Uploading batch') as pbar:
+            commit_info = api.create_commit(
                 repo_id=repo_id,
-                dataset_name=dataset_name
+                repo_type='dataset',
+                operations=operations,
+                commit_message=f'Upload {total_files} data files for {dataset_name}'
             )
+            pbar.update(1)
+        
+        action.log(
+            message_type="upload_complete",
+            commit_url=commit_info.commit_url,
+            total_operations=len(operations),
+            repo_id=repo_id,
+            dataset_name=dataset_name
+        )
+        typer.echo(f"✓ Successfully uploaded {total_files} file(s)")
+        typer.echo(f"  Commit: {commit_info.commit_url}")
+        return True
 

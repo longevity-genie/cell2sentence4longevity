@@ -244,16 +244,17 @@ def upload(
     with start_action(action_type="cli_upload") as action:
         typer.echo("Uploading to HuggingFace...")
         action.log(message_type="upload_started", repo_id=repo_id, output_dir=str(output_dir))
-        upload_to_huggingface(
+        files_uploaded = upload_to_huggingface(
             data_splits_dir=output_dir,
             token=token,
             repo_id=repo_id,
             readme_path=readme_path
         )
         dataset_url = f"https://huggingface.co/datasets/{repo_id}"
-        typer.secho("✓ Upload completed successfully", fg=typer.colors.GREEN)
+        if files_uploaded:
+            typer.secho("✓ Upload completed successfully", fg=typer.colors.GREEN)
         typer.echo(f"Dataset: {dataset_url}")
-        action.log(message_type="upload_completed", repo_id=repo_id, dataset_url=dataset_url)
+        action.log(message_type="upload_completed", repo_id=repo_id, dataset_url=dataset_url, files_uploaded=files_uploaded)
 
 
 def _process_single_file(
@@ -359,16 +360,19 @@ def _process_single_file(
                 typer.echo("="*80)
                 # Upload to same repository as subfolder (dataset_name creates subfolder in repo)
                 action.log(message_type="upload_started", dataset_name=dataset_name, repo_id=repo_id, upload_dir=str(upload_dir))
-                upload_to_huggingface(
+                files_uploaded = upload_to_huggingface(
                     data_splits_dir=upload_dir,
                     token=token,
                     repo_id=repo_id,
                     dataset_name=dataset_name
                 )
                 dataset_url = f"https://huggingface.co/datasets/{repo_id}"
-                typer.secho(f"✓ Upload complete for {dataset_name}\n", fg=typer.colors.GREEN)
-                typer.echo(f"Dataset: {dataset_url} (subfolder: {dataset_name})")
-                action.log(message_type="upload_completed", dataset_name=dataset_name, repo_id=repo_id, dataset_url=dataset_url)
+                if files_uploaded:
+                    typer.secho(f"✓ Upload complete for {dataset_name}\n", fg=typer.colors.GREEN)
+                    typer.echo(f"Dataset: {dataset_url} (subfolder: {dataset_name})")
+                else:
+                    typer.echo(f"Dataset: {dataset_url} (subfolder: {dataset_name})")
+                action.log(message_type="upload_completed", dataset_name=dataset_name, repo_id=repo_id, dataset_url=dataset_url, files_uploaded=files_uploaded)
             
             # Final garbage collection
             gc.collect()
