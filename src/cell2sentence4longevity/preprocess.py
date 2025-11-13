@@ -429,6 +429,7 @@ def _process_single_file(
     token: Optional[str],
     join_collection: bool = True,
     filter_by_age: bool = True,
+    gene_lists_dir: Optional[Path] = None,
 ) -> tuple[bool, str, float, Path]:
     """Process a single h5ad file through the entire pipeline.
     
@@ -486,7 +487,8 @@ def _process_single_file(
                 skip_train_test_split=skip_train_test_split,
                 stratify_by_age=True,
                 join_collection=join_collection,
-                filter_by_age=filter_by_age
+                filter_by_age=filter_by_age,
+                gene_lists_dir=gene_lists_dir
             )
             
             typer.echo("  ✓ Conversion completed")
@@ -633,6 +635,12 @@ def run(
         "--filter-age/--no-age-filter",
         help="Filter out cells with null age values. Default: True (filters out cells without age). Use --no-age-filter to keep all cells regardless of age."
     ),
+    gene_lists_dir: Optional[Path] = typer.Option(
+        Path("./data/shared/gene_lists"),
+        "--gene-lists-dir",
+        "-g",
+        help="Directory containing gene list .txt files (one gene symbol per row). Creates both full_gene_sentence (top 2K genes) and cell_sentence (filtered to genes in lists) columns. Default: ./data/shared/gene_lists. Use empty string or non-existent path to disable."
+    ),
 ) -> None:
     """Run the preprocessing pipeline.
     
@@ -761,6 +769,7 @@ def run(
                 token=token,
                 join_collection=lookup_publication,
                 filter_by_age=filter_by_age,
+                gene_lists_dir=gene_lists_dir,
             )
             
             results.append((dataset_name, success, message, processing_time, dataset_output_path))

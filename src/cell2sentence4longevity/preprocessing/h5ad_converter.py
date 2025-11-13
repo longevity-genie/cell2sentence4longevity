@@ -412,7 +412,59 @@ def map_genes_to_symbols_polars(
         return gene_symbols
 
 
-def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n: Optional[int] = 2000) -> str:
+def load_gene_lists(gene_lists_dir: Path) -> set[str]:
+    """Load gene lists from a directory containing .txt files.
+    
+    Each file should contain one gene symbol per row.
+    All genes from all files are combined into a single set.
+    
+    Args:
+        gene_lists_dir: Directory containing .txt files with gene lists
+        
+    Returns:
+        Set of gene symbols from all files
+    """
+    with start_action(action_type="load_gene_lists", gene_lists_dir=str(gene_lists_dir)) as action:
+        if not gene_lists_dir.exists():
+            action.log(message_type="gene_lists_dir_not_found", path=str(gene_lists_dir))
+            return set()
+        
+        gene_set: set[str] = set()
+        txt_files = list(gene_lists_dir.glob("*.txt"))
+        
+        if not txt_files:
+            action.log(message_type="no_gene_list_files_found", path=str(gene_lists_dir))
+            return set()
+        
+        action.log(message_type="found_gene_list_files", count=len(txt_files))
+        
+        for txt_file in txt_files:
+            with open(txt_file, 'r') as f:
+                genes = [line.strip() for line in f if line.strip()]
+                gene_set.update(genes)
+                action.log(
+                    message_type="loaded_gene_list",
+                    file=txt_file.name,
+                    genes_in_file=len(genes),
+                    total_unique_genes=len(gene_set)
+                )
+        
+        action.log(
+            message_type="gene_lists_loaded",
+            total_files=len(txt_files),
+            total_unique_genes=len(gene_set)
+        )
+        
+        return gene_set
+
+
+def create_cell_sentence(
+    cell_expr: np.ndarray, 
+    gene_symbols: np.ndarray, 
+    top_n: Optional[int] = 2000,
+    gene_list_filter: Optional[set[str]] = None,
+    return_full_sentence: bool = False
+) -> str | tuple[str, str]:
     """Create cell sentence from expression data.
     
     Uses argpartition for faster top-k selection (O(n) vs O(n log n) for full sort).
@@ -422,9 +474,12 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
         cell_expr: Expression values for a single cell
         gene_symbols: Array of gene symbols corresponding to expression values
         top_n: Number of top genes to include in sentence. If None, uses all valid genes.
+        gene_list_filter: Optional set of gene symbols to filter by (for longevity genes, etc.)
+        return_full_sentence: If True and gene_list_filter is provided, returns (filtered_sentence, full_sentence)
     
     Returns:
-        Space-separated string of top expressed genes (excluding Ensembl IDs)
+        If return_full_sentence and gene_list_filter: tuple of (filtered_sentence, full_sentence)
+        Otherwise: Space-separated string of top expressed genes (excluding Ensembl IDs)
     """
     # First, filter out Ensembl IDs (genes starting with "ENS")
     # Create a mask for valid gene symbols (not Ensembl IDs)
@@ -437,6 +492,8 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
     if len(valid_indices) == 0:
         # Fallback: no valid genes, return empty string or use all genes anyway
         # For now, let's return empty to make the problem visible
+        if return_full_sentence and gene_list_filter is not None:
+            return "", ""
         return ""
     
     # Filter expression and symbols to only valid genes
@@ -456,8 +513,23 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
     
     # Convert to gene symbols using numpy array indexing (faster than list comprehension)
     top_genes = valid_symbols[top_gene_indices]
-    # Create space-separated string
-    return ' '.join(top_genes.tolist())
+    
+    # If gene_list_filter is provided, create filtered version
+    if gene_list_filter is not None:
+        # Create full sentence from all sorted genes
+        full_sentence = ' '.join(top_genes.tolist())
+        
+        # Filter to only genes in gene_list_filter (preserving order)
+        filtered_genes = [gene for gene in top_genes if gene in gene_list_filter]
+        filtered_sentence = ' '.join(filtered_genes)
+        
+        if return_full_sentence:
+            return filtered_sentence, full_sentence
+        else:
+            return filtered_sentence
+    else:
+        # Create space-separated string
+        return ' '.join(top_genes.tolist())
 
 
 def convert_h5ad_to_parquet(
@@ -758,7 +830,8 @@ def convert_h5ad_to_train_test(
     skip_train_test_split: bool = False,
     stratify_by_age: bool = True,
     join_collection: bool = True,
-    filter_by_age: bool = True
+    filter_by_age: bool = True,
+    gene_lists_dir: Optional[Path] = None
 ) -> None:
     """Convert h5ad file directly to train/test parquet splits in one streaming pass.
     
@@ -783,6 +856,11 @@ def convert_h5ad_to_train_test(
     - If filter_by_age=False, keeps all cells regardless of age (useful for datasets without age information)
     - When stratify_by_age=True, filtering is still required for stratification to work properly
     
+    Gene list filtering behavior:
+    - If gene_lists_dir is provided, loads all .txt files from that directory as gene lists
+    - Creates both full_gene_sentence (top 2K genes) and cell_sentence (filtered to genes in gene lists)
+    - The full_gene_sentence preserves expression ordering, and cell_sentence filters from this ordered list
+    
     Args:
         h5ad_path: Path to the h5ad file
         output_dir: Directory to save train/test splits
@@ -798,6 +876,7 @@ def convert_h5ad_to_train_test(
         stratify_by_age: If True, maintains age distribution in train/test splits (default: True)
         join_collection: If True (default), auto-detects cellxgene datasets and always adds dataset_id column. Only joins with collections metadata if dataset is found in collections cache. If False, skips collection joining and does not add dataset_id column.
         filter_by_age: If True (default), filters out cells with null age values. If False, keeps all cells regardless of age.
+        gene_lists_dir: Optional directory containing .txt files with gene lists (one gene per row). If provided, creates full_gene_sentence and filtered cell_sentence columns.
     """
     start_time = time.time()
     
@@ -816,7 +895,8 @@ def convert_h5ad_to_train_test(
         skip_train_test_split=skip_train_test_split,
         stratify_by_age=stratify_by_age,
         join_collection=join_collection,
-        filter_by_age=filter_by_age
+        filter_by_age=filter_by_age,
+        gene_lists_dir=str(gene_lists_dir) if gene_lists_dir else None
     ) as action:
         action.log(message_type="processing_started", h5ad_file=str(h5ad_path))
         
@@ -860,6 +940,33 @@ def convert_h5ad_to_train_test(
         # Map genes to symbols using Polars
         gene_symbols_list = map_genes_to_symbols_polars(adata, hgnc_df, use_hgnc=use_hgnc)
         gene_symbols = np.array(gene_symbols_list, dtype=object)
+        
+        # Load gene lists if provided
+        gene_list_filter: Optional[set[str]] = None
+        if gene_lists_dir is not None:
+            if gene_lists_dir.exists():
+                gene_list_filter = load_gene_lists(gene_lists_dir)
+                if gene_list_filter:
+                    action.log(
+                        message_type="gene_list_filter_enabled",
+                        total_genes_in_filter=len(gene_list_filter),
+                        will_create_full_gene_sentence=True,
+                        gene_lists_dir=str(gene_lists_dir)
+                    )
+                else:
+                    action.log(
+                        message_type="gene_list_filter_empty",
+                        warning="Gene lists directory provided but no genes loaded, proceeding without filter",
+                        gene_lists_dir=str(gene_lists_dir)
+                    )
+            else:
+                action.log(
+                    message_type="gene_lists_dir_not_found",
+                    warning=f"Gene lists directory not found: {gene_lists_dir}, proceeding without filter",
+                    gene_lists_dir=str(gene_lists_dir)
+                )
+        else:
+            action.log(message_type="gene_list_filter_disabled")
         
         # Create output directory structure
         if skip_train_test_split:
@@ -989,10 +1096,24 @@ def convert_h5ad_to_train_test(
                 chunk_X = adata.X[start_idx:end_idx].toarray()
                 
                 # Create cell sentences for each cell in chunk
-                cell_sentences = [
-                    create_cell_sentence(cell_expr, gene_symbols, top_genes)
-                    for cell_expr in chunk_X
-                ]
+                if gene_list_filter:
+                    # Create both filtered and full sentences
+                    sentence_results = [
+                        create_cell_sentence(cell_expr, gene_symbols, top_genes, 
+                                           gene_list_filter=gene_list_filter, 
+                                           return_full_sentence=True)
+                        for cell_expr in chunk_X
+                    ]
+                    # Unpack into two lists
+                    cell_sentences = [result[0] for result in sentence_results]
+                    full_gene_sentences = [result[1] for result in sentence_results]
+                else:
+                    # Standard processing without gene list filter
+                    cell_sentences = [
+                        create_cell_sentence(cell_expr, gene_symbols, top_genes)
+                        for cell_expr in chunk_X
+                    ]
+                    full_gene_sentences = None
                 
                 # Build chunk data with all metadata
                 # Slice rows first (more memory-efficient for backed mode), then select columns
@@ -1004,6 +1125,10 @@ def convert_h5ad_to_train_test(
                 
                 # Add cell_sentence column
                 chunk_obs_data['cell_sentence'] = cell_sentences
+                
+                # Add full_gene_sentence column if gene list filter is enabled
+                if full_gene_sentences is not None:
+                    chunk_obs_data['full_gene_sentence'] = full_gene_sentences
                 
                 # Create Polars DataFrame
                 chunk_df = pl.DataFrame(chunk_obs_data)

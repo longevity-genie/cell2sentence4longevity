@@ -1,5 +1,7 @@
 """CLI tool for extracting metadata fields from h5ad AnnData files."""
 
+import gc
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -100,8 +102,9 @@ def extract_fields_from_h5ad(
             chunk_size=chunk_size
         )
         
-        # Collect all chunks
-        all_chunks: list[pl.DataFrame] = []
+        # Create temp directory for chunks
+        temp_dir = output_path.parent / f".temp_{output_path.stem}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
         
         for chunk_idx in tqdm(range(n_chunks), desc='Extracting metadata'):
             with start_action(action_type="process_chunk", chunk_idx=chunk_idx) as chunk_action:
@@ -114,21 +117,32 @@ def extract_fields_from_h5ad(
                 # Extract only requested fields
                 chunk_pandas = chunk_obs[valid_fields]
                 
-                # Convert pandas DataFrame directly to Polars (more efficient)
+                # Convert pandas DataFrame directly to Polars
                 chunk_prepared = _prepare_pandas_for_polars(chunk_pandas)
                 chunk_df = pl.from_pandas(chunk_prepared)
-                all_chunks.append(chunk_df)
+                
+                # Write chunk to temp file
+                chunk_file = temp_dir / f"chunk_{chunk_idx:04d}.parquet"
+                chunk_df.write_parquet(
+                    chunk_file,
+                    compression=compression,
+                    compression_level=compression_level,
+                    use_pyarrow=use_pyarrow
+                )
+                
+                # Clean up chunk data immediately
+                del chunk_pandas, chunk_prepared, chunk_df, chunk_obs
                 
                 chunk_action.log(
                     message_type="chunk_processed",
-                    rows=len(chunk_df),
+                    rows=end_idx - start_idx,
                     start_idx=start_idx,
                     end_idx=end_idx
                 )
         
-        # Concatenate all chunks
-        action.log(message_type="concatenating_chunks", n_chunks=len(all_chunks))
-        final_df = pl.concat(all_chunks)
+        # Read all chunks using scan_parquet (lazy) and collect
+        action.log(message_type="collecting_chunks_lazily", n_chunks=n_chunks)
+        final_df = pl.scan_parquet(temp_dir / "*.parquet").collect()
         
         # Extract age if requested
         if extract_age:
@@ -200,7 +214,7 @@ def extract_fields_from_h5ad(
                     note="Dataset does not match CellxGene UUID pattern, skipping collection join"
                 )
         
-        # Write to parquet
+        # Write to parquet using sink_parquet for memory efficiency
         action.log(
             message_type="writing_parquet",
             output_path=str(output_path),
@@ -209,12 +223,18 @@ def extract_fields_from_h5ad(
         )
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        final_df.write_parquet(
+        
+        # Use lazy API with sink_parquet for memory-efficient writing
+        final_df.lazy().sink_parquet(
             output_path,
             compression=compression,
-            compression_level=compression_level,
-            use_pyarrow=use_pyarrow
+            compression_level=compression_level
         )
+        
+        # Clean up temp directory
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+            action.log(message_type="temp_dir_cleaned", temp_dir=str(temp_dir))
         
         file_size_mb = output_path.stat().st_size / (1024 * 1024)
         action.log(
@@ -393,8 +413,10 @@ def extract_fields_from_h5ad(
                     columns_count=len(summary_df.columns)
                 )
         
-        # Close the h5ad file
+        # Close the h5ad file and clean up
         adata.file.close()
+        del adata, final_df
+        action.log(message_type="h5ad_file_closed")
 
 
 @app.command()
@@ -621,6 +643,9 @@ def batch(
                     typer.echo(f"  ✗ Error: {message}", err=True)
                 
                 results.append((dataset_name, success, message))
+                
+                # Force garbage collection after each file
+                gc.collect()
         
         # Summary
         successful = sum(1 for _, success, _ in results if success)
@@ -657,14 +682,16 @@ def batch(
                     )
                     
                     # Generate summaries for each metadata file
-                    summaries_with_organism = []
-                    for meta_file in meta_files:
+                    summary_temp_dir = output_dir / ".temp_summaries"
+                    summary_temp_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    for idx, meta_file in enumerate(meta_files):
                         dataset_id = meta_file.stem.replace("_meta", "")
                         h5ad_file = input_dir / f"{dataset_id}.h5ad"
                         
                         try:
-                            # Read metadata
-                            meta_df = pl.read_parquet(meta_file)
+                            # Read metadata (only what we need)
+                            meta_df = pl.scan_parquet(meta_file).collect()
                             
                             # Get organism
                             organism = None
@@ -677,6 +704,7 @@ def batch(
                                     if 'organism' in adata.obs.columns:
                                         organism = adata.obs['organism'][0]
                                     adata.file.close()
+                                    del adata
                                 except Exception as e:
                                     summary_action.log(
                                         message_type="error_reading_h5ad",
@@ -783,9 +811,13 @@ def batch(
                             if 'publication_doi' in meta_df.columns:
                                 summary_data["publication_doi"] = meta_df['publication_doi'][0]
                             
-                            # Create summary dataframe
+                            # Create summary dataframe and write immediately
                             summary_df = pl.DataFrame([summary_data])
-                            summaries_with_organism.append(summary_df)
+                            summary_file = summary_temp_dir / f"summary_{idx:04d}.parquet"
+                            summary_df.write_parquet(summary_file)
+                            
+                            # Clean up
+                            del meta_df, summary_df, summary_data
                             
                         except Exception as e:
                             summary_action.log(
@@ -794,9 +826,21 @@ def batch(
                                 error=str(e)
                             )
                     
-                    if summaries_with_organism:
-                        # Concatenate all summaries
-                        combined = pl.concat(summaries_with_organism, how="diagonal_relaxed")
+                    # Read all summaries using lazy API but handle schema differences
+                    summary_files = sorted(summary_temp_dir.glob("summary_*.parquet"))
+                    if summary_files:
+                        # Read summaries one by one to handle schema differences
+                        # But don't keep them all in memory - process immediately
+                        all_summaries_list = []
+                        for summary_file in summary_files:
+                            summary = pl.read_parquet(summary_file)
+                            all_summaries_list.append(summary)
+                            del summary
+                        
+                        # Combine with diagonal_relaxed to handle schema differences
+                        combined = pl.concat(all_summaries_list, how="diagonal_relaxed")
+                        del all_summaries_list
+                        gc.collect()
                         
                         # Sort by cells_with_age_years (descending), putting datasets with more age data first
                         # Fill null values with 0 for sorting
@@ -819,8 +863,8 @@ def batch(
                                 # Ensure directory exists
                                 organism_file.parent.mkdir(parents=True, exist_ok=True)
                                 
-                                # Write summary file
-                                organism_summaries.write_csv(organism_file, separator=separator)
+                                # Write summary file using lazy API
+                                organism_summaries.lazy().sink_csv(organism_file, separator=separator)
                                 
                                 summary_action.log(
                                     message_type="species_summary_created",
@@ -834,7 +878,7 @@ def batch(
                         # Also save a combined summary with all organisms
                         all_summary_file = output_dir / f"all_datasets_summary.{summary_format_lower}"
                         all_summary_file.parent.mkdir(parents=True, exist_ok=True)
-                        combined.write_csv(all_summary_file, separator=separator)
+                        combined.lazy().sink_csv(all_summary_file, separator=separator)
                         summary_action.log(
                             message_type="combined_summary_created",
                             file=str(all_summary_file),
@@ -842,6 +886,15 @@ def batch(
                             format=summary_format_lower
                         )
                         typer.echo(f"  Generated all_datasets_summary.{summary_format_lower} ({len(combined)} datasets)")
+                        
+                        # Clean up temp summaries directory
+                        if summary_temp_dir.exists():
+                            shutil.rmtree(summary_temp_dir)
+                            summary_action.log(message_type="temp_summaries_cleaned")
+                        
+                        # Clean up combined dataframe
+                        del combined
+                        gc.collect()
         
         typer.echo(f"\n{'='*60}")
         typer.echo(f"Batch processing complete:")
