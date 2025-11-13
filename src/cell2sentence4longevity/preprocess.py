@@ -641,6 +641,11 @@ def run(
         "-g",
         help="Directory containing gene list .txt files (one gene symbol per row). Creates both full_gene_sentence (top 2K genes) and cell_sentence (filtered to genes in lists) columns. Default: ./data/shared/gene_lists. Use empty string or non-existent path to disable."
     ),
+    max_file_size_mb: Optional[float] = typer.Option(
+        None,
+        "--max-file-size-mb",
+        help="Maximum file size in MB to process (e.g., 12000 for 12 GB). Files larger than this will be skipped."
+    ),
 ) -> None:
     """Run the preprocessing pipeline.
     
@@ -746,6 +751,22 @@ def run(
             if process_multiple:
                 # Progress indicator for batch mode
                 typer.echo(f"\n[{idx}/{len(h5ad_files)}] Processing: {dataset_name}")
+            
+            # Check file size if limit is specified
+            if max_file_size_mb is not None:
+                file_size_mb = h5ad_file.stat().st_size / (1024 * 1024)
+                if file_size_mb > max_file_size_mb:
+                    action.log(
+                        message_type="skipping_large_file",
+                        dataset_name=dataset_name,
+                        file=h5ad_file.name,
+                        file_size_mb=round(file_size_mb, 2),
+                        max_file_size_mb=max_file_size_mb
+                    )
+                    skip_message = f"skipped (file too large: {file_size_mb:.2f} MB > {max_file_size_mb} MB)"
+                    typer.echo(f"  Skipping (file size {file_size_mb:.2f} MB exceeds limit {max_file_size_mb} MB)")
+                    results.append((dataset_name, False, skip_message, 0.0, dataset_output_path))
+                    continue
             
             # Check if output already exists and skip if flag is enabled
             if skip_existing and check_output_exists(output_dir, dataset_name, skip_train_test_split):

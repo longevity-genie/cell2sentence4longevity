@@ -1,12 +1,12 @@
 [project]
 name = "cell2sentence4longevity"
-version = "0.1.1"
+version = "0.1.2"
 description = "Cell to sentence preprocessing pipeline for longevity research"
 readme = "README.md"
 authors = [
     { name = "antonkulaga", email = "antonkulaga@gmail.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "jupyterlab>=4.4.10",
     "polars>=1.35.2",
@@ -23,13 +23,8 @@ dependencies = [
     "pycomfort>=0.0.18",
     "python-dotenv>=1.2.1",
     "cellxgene-census>=1.17.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.3.4",
-    "pytest-cov>=6.0.0",
-    "psutil>=6.2.0",
+    "pytest>=9.0.1",
+    "psutil>=7.1.3"
 ]
 
 [project.scripts]

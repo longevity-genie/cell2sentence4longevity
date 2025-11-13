@@ -14,6 +14,11 @@ from eliot import start_action
 from tqdm import tqdm
 import polars as pl
 
+from cell2sentence4longevity.preprocessing.obs_stream import (
+    infer_obs_schema,
+    list_obs_columns_from_group,
+    read_obs_chunk_dict,
+)
 
 def extract_age_columns(df: pl.DataFrame, development_stage_col: str = 'development_stage') -> pl.DataFrame:
     """Extract age in years (for humans) and age in months (for mice) using Polars regex.
@@ -261,7 +266,7 @@ def map_genes_to_symbols_polars(
     adata: ad.AnnData,
     hgnc_df: pl.DataFrame | None = None,
     use_hgnc: bool = True
-) -> List[str]:
+) -> np.ndarray:
     """Map Ensembl IDs to gene symbols using Polars for fast joins.
     
     Args:
@@ -270,7 +275,7 @@ def map_genes_to_symbols_polars(
         use_hgnc: Whether to use HGNC mapping (True) or use var_names directly (False)
         
     Returns:
-        List of gene symbols (Ensembl IDs are filtered out during sentence creation)
+        NumPy array of gene symbols (more memory-efficient than list)
     """
     with start_action(action_type="map_genes_to_symbols_polars", use_hgnc=use_hgnc) as action:
         n_genes = adata.n_vars
@@ -292,10 +297,13 @@ def map_genes_to_symbols_polars(
                     use_feature_name = True
                     action.log(message_type="using_feature_name_column", reason="contains_gene_symbols")
             
+            # Use numpy arrays directly - more memory-efficient than creating lists first
             if use_feature_name:
-                gene_symbols = [str(adata.var['feature_name'].iloc[i]) for i in range(n_genes)]
+                # Access underlying data directly if possible
+                gene_symbols = np.array(adata.var['feature_name'].values, dtype=object)
             else:
-                gene_symbols = list(adata.var_names)
+                # var_names is already a pandas Index, convert directly to numpy
+                gene_symbols = np.array(adata.var_names, dtype=object)
             
             action.log(
                 message_type="gene_mapping_summary",
@@ -317,18 +325,19 @@ def map_genes_to_symbols_polars(
                 hgnc_df = hgnc_df.rename({old_name: new_name})
         
         # Create DataFrame from adata with var_names and feature_name
+        # Use numpy arrays to avoid list comprehensions
         has_feature_name = 'feature_name' in adata.var.columns
         
         if has_feature_name:
             genes_df = pl.DataFrame({
-                'ensembl_gene_id': list(adata.var_names),
-                'feature_name': [str(adata.var['feature_name'].iloc[i]) for i in range(n_genes)],
-                'original_index': list(range(n_genes))
+                'ensembl_gene_id': adata.var_names.values,
+                'feature_name': adata.var['feature_name'].values.astype(str),
+                'original_index': np.arange(n_genes)
             })
         else:
             genes_df = pl.DataFrame({
-                'ensembl_gene_id': list(adata.var_names),
-                'original_index': list(range(n_genes))
+                'ensembl_gene_id': adata.var_names.values,
+                'original_index': np.arange(n_genes)
             })
         
         # Join with HGNC to get official symbols
@@ -377,8 +386,8 @@ def map_genes_to_symbols_polars(
             )
             mapped_df = mapped_df.unique(subset=['original_index'], keep='first')
         
-        # Extract gene symbols list
-        gene_symbols = mapped_df['final_symbol'].to_list()
+        # Convert to numpy array directly (more memory-efficient than list)
+        gene_symbols = mapped_df['final_symbol'].to_numpy()
         
         # Final validation: ensure we have the correct number of genes
         if len(gene_symbols) != n_genes:
@@ -412,124 +421,142 @@ def map_genes_to_symbols_polars(
         return gene_symbols
 
 
-def load_gene_lists(gene_lists_dir: Path) -> set[str]:
+def load_gene_lists(gene_lists_dir: Path) -> dict[str, set[str]]:
     """Load gene lists from a directory containing .txt files.
     
     Each file should contain one gene symbol per row.
-    All genes from all files are combined into a single set.
+    Returns a dictionary mapping filestem to set of genes.
     
     Args:
         gene_lists_dir: Directory containing .txt files with gene lists
         
     Returns:
-        Set of gene symbols from all files
+        Dictionary mapping filestem (without .txt) to set of gene symbols
     """
     with start_action(action_type="load_gene_lists", gene_lists_dir=str(gene_lists_dir)) as action:
         if not gene_lists_dir.exists():
             action.log(message_type="gene_lists_dir_not_found", path=str(gene_lists_dir))
-            return set()
+            return {}
         
-        gene_set: set[str] = set()
-        txt_files = list(gene_lists_dir.glob("*.txt"))
+        gene_lists: dict[str, set[str]] = {}
+        txt_files = sorted(gene_lists_dir.glob("*.txt"))  # Sort for consistent ordering
         
         if not txt_files:
             action.log(message_type="no_gene_list_files_found", path=str(gene_lists_dir))
-            return set()
+            return {}
         
         action.log(message_type="found_gene_list_files", count=len(txt_files))
         
         for txt_file in txt_files:
+            filestem = txt_file.stem
             with open(txt_file, 'r') as f:
-                genes = [line.strip() for line in f if line.strip()]
-                gene_set.update(genes)
+                genes = {line.strip() for line in f if line.strip()}
+                gene_lists[filestem] = genes
                 action.log(
                     message_type="loaded_gene_list",
                     file=txt_file.name,
-                    genes_in_file=len(genes),
-                    total_unique_genes=len(gene_set)
+                    filestem=filestem,
+                    genes_in_file=len(genes)
                 )
         
         action.log(
             message_type="gene_lists_loaded",
             total_files=len(txt_files),
-            total_unique_genes=len(gene_set)
+            filestems=list(gene_lists.keys())
         )
         
-        return gene_set
+        return gene_lists
 
 
 def create_cell_sentence(
     cell_expr: np.ndarray, 
     gene_symbols: np.ndarray, 
     top_n: Optional[int] = 2000,
-    gene_list_filter: Optional[set[str]] = None,
-    return_full_sentence: bool = False
-) -> str | tuple[str, str]:
+    gene_lists: Optional[dict[str, set[str]]] = None
+) -> dict[str, str]:
     """Create cell sentence from expression data.
     
-    Uses argpartition for faster top-k selection (O(n) vs O(n log n) for full sort).
-    Filters out Ensembl IDs to ensure only proper gene symbols are included.
+    Always sorts ALL genes by expression first. Then creates:
+    - gene_sentence_all: All genes sorted by expression (excluding Ensembl IDs)
+    - gene_sentence_2000: First 2000 genes (or top_n) from gene_sentence_all (just slicing, no re-sorting)
+    - gene_sentence_<filestem>: One column per gene list, filtering from gene_sentence_all (preserving order)
     
     Args:
         cell_expr: Expression values for a single cell
         gene_symbols: Array of gene symbols corresponding to expression values
-        top_n: Number of top genes to include in sentence. If None, uses all valid genes.
-        gene_list_filter: Optional set of gene symbols to filter by (for longevity genes, etc.)
-        return_full_sentence: If True and gene_list_filter is provided, returns (filtered_sentence, full_sentence)
+        top_n: Number of top genes for gene_sentence_2000. Default: 2000
+        gene_lists: Optional dict mapping filestem to set of gene symbols for filtering
     
     Returns:
-        If return_full_sentence and gene_list_filter: tuple of (filtered_sentence, full_sentence)
-        Otherwise: Space-separated string of top expressed genes (excluding Ensembl IDs)
+        Dictionary with keys:
+        - 'gene_sentence_all': All genes sorted by expression
+        - 'gene_sentence_2000': Top N genes (or 'gene_sentence_{top_n}' if top_n != 2000)
+        - 'gene_sentence_<filestem>': One for each gene list (if gene_lists provided)
     """
-    # First, filter out Ensembl IDs (genes starting with "ENS")
-    # Create a mask for valid gene symbols (not Ensembl IDs)
-    valid_mask = np.array([not str(gene).startswith("ENS") for gene in gene_symbols], dtype=bool)
+    # First, filter out Ensembl IDs (genes starting with "ENS") using vectorized operations
+    # This is much faster than list comprehension with str() conversion
+    if gene_symbols.dtype.kind in ('U', 'S', 'O'):  # Unicode, byte string, or object
+        # For string arrays, use vectorized startswith
+        if hasattr(gene_symbols, 'astype'):
+            # Ensure we have a proper numpy array of strings
+            gene_symbols_str = gene_symbols.astype(str) if gene_symbols.dtype == object else gene_symbols
+        else:
+            gene_symbols_str = np.asarray(gene_symbols, dtype=str)
+        
+        # Vectorized string operation - much faster than list comprehension
+        valid_mask = ~np.char.startswith(gene_symbols_str, 'ENS')
+    else:
+        # Fallback for non-string types
+        valid_mask = np.array([not str(gene).startswith("ENS") for gene in gene_symbols], dtype=bool)
     
-    # Get indices of valid genes
     valid_indices = np.where(valid_mask)[0]
     
-    # If we don't have enough valid genes, use what we have
     if len(valid_indices) == 0:
-        # Fallback: no valid genes, return empty string or use all genes anyway
-        # For now, let's return empty to make the problem visible
-        if return_full_sentence and gene_list_filter is not None:
-            return "", ""
-        return ""
+        # No valid genes, return empty strings
+        result = {'gene_sentence_all': '', f'gene_sentence_{top_n}': ''}
+        if gene_lists:
+            for filestem in gene_lists:
+                result[f'gene_sentence_{filestem}'] = ''
+        return result
     
     # Filter expression and symbols to only valid genes
     valid_expr = cell_expr[valid_indices]
     valid_symbols = gene_symbols[valid_indices]
     
-    # Use argpartition for faster top-k selection (much faster than full sort)
-    # Get indices of top N expressed genes from valid genes
-    # If top_n is None, use all genes
-    if top_n is None or top_n >= len(valid_expr):
-        top_gene_indices = np.argsort(valid_expr)[::-1]
+    # Sort ALL genes by expression (descending order)
+    sorted_indices = np.argsort(valid_expr)[::-1]
+    # Keep as numpy array for efficient slicing, convert to list only once
+    all_genes_sorted_array = valid_symbols[sorted_indices]
+    
+    # Create result dictionary
+    result: dict[str, str] = {}
+    
+    # Build all sentences in one pass to minimize string operations
+    # 1. gene_sentence_all: All genes (convert array to list then join)
+    all_genes_list = all_genes_sorted_array.tolist()
+    result['gene_sentence_all'] = ' '.join(all_genes_list)
+    
+    # 2. gene_sentence_2000 (or gene_sentence_{top_n}): First N genes
+    if top_n is None:
+        top_n_key = 'gene_sentence_all'  # If no limit, same as all
     else:
-        # argpartition is O(n) vs argsort which is O(n log n)
-        top_gene_indices = np.argpartition(valid_expr, -top_n)[-top_n:]
-        # Sort only the top N (much smaller than sorting all)
-        top_gene_indices = top_gene_indices[np.argsort(valid_expr[top_gene_indices])[::-1]]
-    
-    # Convert to gene symbols using numpy array indexing (faster than list comprehension)
-    top_genes = valid_symbols[top_gene_indices]
-    
-    # If gene_list_filter is provided, create filtered version
-    if gene_list_filter is not None:
-        # Create full sentence from all sorted genes
-        full_sentence = ' '.join(top_genes.tolist())
-        
-        # Filter to only genes in gene_list_filter (preserving order)
-        filtered_genes = [gene for gene in top_genes if gene in gene_list_filter]
-        filtered_sentence = ' '.join(filtered_genes)
-        
-        if return_full_sentence:
-            return filtered_sentence, full_sentence
+        # Only slice and join once, reuse the sliced portion from numpy array for efficiency
+        if top_n < len(all_genes_sorted_array):
+            # More efficient: slice the array first, then convert and join
+            result[f'gene_sentence_{top_n}'] = ' '.join(all_genes_sorted_array[:top_n].tolist())
         else:
-            return filtered_sentence
-    else:
-        # Create space-separated string
-        return ' '.join(top_genes.tolist())
+            # If top_n >= all genes, reuse gene_sentence_all
+            result[f'gene_sentence_{top_n}'] = result['gene_sentence_all']
+    
+    # 3. gene_sentence_<filestem>: Filter for each gene list (preserving order from all_genes_sorted)
+    if gene_lists:
+        # Pre-convert to list once for filtering (already done above as all_genes_list)
+        for filestem, gene_set in gene_lists.items():
+            # List comprehension with set membership is still the fastest approach for filtering
+            filtered_genes = [gene for gene in all_genes_list if gene in gene_set]
+            result[f'gene_sentence_{filestem}'] = ' '.join(filtered_genes)
+    
+    return result
 
 
 def convert_h5ad_to_parquet(
@@ -624,10 +651,11 @@ def convert_h5ad_to_parquet(
                       fallback="Will use var_names or feature_name from h5ad")
             use_hgnc = False
         
-        # Map genes to symbols using Polars
-        gene_symbols_list = map_genes_to_symbols_polars(adata, hgnc_df, use_hgnc=use_hgnc)
-        # Convert to numpy array for faster indexing
-        gene_symbols = np.array(gene_symbols_list, dtype=object)
+        # Map genes to symbols using Polars (returns numpy array directly)
+        gene_symbols = map_genes_to_symbols_polars(adata, hgnc_df, use_hgnc=use_hgnc)
+        # Clear HGNC DataFrame to free memory (no longer needed)
+        if hgnc_df is not None:
+            del hgnc_df
         
         # Create output directory structure: output_dir/dataset_name/
         # If output_dir already ends with dataset_name, use it directly (avoid double nesting)
@@ -638,17 +666,11 @@ def convert_h5ad_to_parquet(
         chunks_dir.mkdir(parents=True, exist_ok=True)
         action.log(message_type="output_directory_created", chunks_dir=str(chunks_dir))
         
-        # Get column names from obs once (outside loop)
-        obs_columns = list(adata.obs.columns)
-        
-        # Helper: ensure Polars-compatible arrays (convert pandas Categorical to string)
-        def _to_polars_compatible(values) -> np.ndarray:
-            # Pandas categorical exposes dtype.name == 'category' even without importing pandas explicitly
-            dtype_name = getattr(values, "dtype", None)
-            dtype_name = getattr(dtype_name, "name", None)
-            if dtype_name == "category":
-                return values.astype(str).to_numpy()
-            return values.to_numpy() if hasattr(values, "to_numpy") else np.asarray(values, dtype=object)
+        obs_group = adata.file["obs"]
+        obs_columns = list_obs_columns_from_group(obs_group)
+        obs_schema = infer_obs_schema(obs_group)
+        string_fields = {col for col, dtype in obs_schema.items() if dtype == pl.String}
+        categorical_cache: dict[str, np.ndarray] = {}
         
         n_cells = adata.n_obs
         chunk_idx = 0
@@ -666,22 +688,38 @@ def convert_h5ad_to_parquet(
             while cell_idx < n_cells:
                 # Process a batch
                 batch_end = min(cell_idx + batch_size, n_cells)
-                batch_X = adata.X[cell_idx:batch_end].toarray()
+
+                # Create cell sentences for batch without materializing a large dense block
+                # This keeps memory bounded even for very wide matrices or large h5ad files.
+                batch_sentence_results: list[dict[str, str]] = []
+                for row_idx in range(cell_idx, batch_end):
+                    cell_row = adata.X[row_idx]
+                    # For sparse matrices, getrow().toarray() returns a small dense vector
+                    if hasattr(cell_row, "toarray"):
+                        cell_expr = cell_row.toarray().ravel()
+                    else:
+                        # Dense backend: rely on numpy array view
+                        cell_expr = np.asarray(cell_row).ravel()
+                    batch_sentence_results.append(
+                        create_cell_sentence(cell_expr, gene_symbols, top_genes)
+                    )
                 
-                # Create cell sentences for batch
-                batch_sentences = [
-                    create_cell_sentence(cell_expr, gene_symbols, top_genes)
-                    for cell_expr in batch_X
-                ]
+                batch_obs_data = read_obs_chunk_dict(
+                    obs_group=obs_group,
+                    fields=obs_columns,
+                    start_idx=cell_idx,
+                    end_idx=batch_end,
+                    categorical_cache=categorical_cache,
+                    as_lists=True,
+                    string_fields=string_fields,
+                    string_fill_value="nan"
+                )
                 
-                # Get metadata for batch
-                # Slice rows first (more memory-efficient for backed mode), then select columns
-                batch_obs_slice = adata.obs.iloc[cell_idx:batch_end]
-                batch_obs_data = {}
-                for col in obs_columns:
-                    series_slice = batch_obs_slice[col]
-                    batch_obs_data[col] = _to_polars_compatible(series_slice)
-                batch_obs_data['cell_sentence'] = batch_sentences
+                # Add all gene sentence columns from the results
+                if batch_sentence_results:
+                    sentence_keys = batch_sentence_results[0].keys()
+                    for key in sentence_keys:
+                        batch_obs_data[key] = [result[key] for result in batch_sentence_results]
                 
                 # Add batch to current chunk
                 if not current_chunk_data:
@@ -696,8 +734,32 @@ def convert_h5ad_to_parquet(
                             # Convert to list and extend
                             current_chunk_data[col] = list(current_chunk_data[col]) + list(batch_obs_data[col])
                 
+                # Clear batch data to free memory immediately
+                del batch_obs_data, batch_sentence_results
+                
                 # Check size by creating DataFrame and writing to temp file
                 chunk_df = pl.DataFrame(current_chunk_data)
+                cast_exprs = [
+                    pl.col(col).cast(dtype, strict=False)
+                    for col, dtype in obs_schema.items()
+                    if col in chunk_df.columns
+                ]
+                if cast_exprs:
+                    chunk_df = chunk_df.with_columns(cast_exprs)
+                string_fill_exprs = [
+                    pl.col(col).fill_null("nan")
+                    for col, dtype in obs_schema.items()
+                    if dtype == pl.String and col in chunk_df.columns
+                ]
+                if string_fill_exprs:
+                    chunk_df = chunk_df.with_columns(string_fill_exprs)
+                string_fill_exprs = [
+                    pl.col(col).fill_null("nan")
+                    for col, dtype in obs_schema.items()
+                    if dtype == pl.String and col in chunk_df.columns
+                ]
+                if string_fill_exprs:
+                    chunk_df = chunk_df.with_columns(string_fill_exprs)
                 # Add age column using Polars expression
                 chunk_df = extract_age_column(chunk_df)
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.parquet') as tmp_file:
@@ -734,6 +796,9 @@ def convert_h5ad_to_parquet(
                     chunk_idx += 1
                     current_chunk_data = {}
                 
+                # Always delete chunk_df after use
+                del chunk_df
+                
                 cell_idx = batch_end
             
             n_chunks = chunk_idx
@@ -747,30 +812,52 @@ def convert_h5ad_to_parquet(
                     start_idx = chunk_idx * chunk_size
                     end_idx = min(start_idx + chunk_size, n_cells)
                     
-                    # Read chunk of expression matrix
-                    chunk_X = adata.X[start_idx:end_idx].toarray()
+                    # Create cell sentences for each cell in chunk without creating a large dense block.
+                    # This keeps memory bounded even for very wide matrices or extremely large h5ad files.
+                    chunk_sentence_results: list[dict[str, str]] = []
+                    for row_idx in range(start_idx, end_idx):
+                        cell_row = adata.X[row_idx]
+                        if hasattr(cell_row, "toarray"):
+                            cell_expr = cell_row.toarray().ravel()
+                        else:
+                            cell_expr = np.asarray(cell_row).ravel()
+                        chunk_sentence_results.append(
+                            create_cell_sentence(cell_expr, gene_symbols, top_genes)
+                        )
                     
-                    # Create cell sentences for each cell in chunk
-                    # Using list comprehension is faster than explicit loop
-                    cell_sentences = [
-                        create_cell_sentence(cell_expr, gene_symbols, top_genes)
-                        for cell_expr in chunk_X
-                    ]
+                    chunk_obs_data = read_obs_chunk_dict(
+                        obs_group=obs_group,
+                        fields=obs_columns,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        categorical_cache=categorical_cache,
+                        as_lists=True,
+                        string_fields=string_fields,
+                        string_fill_value="nan"
+                    )
                     
-                    # Build Polars DataFrame directly from obs data (skip pandas intermediate)
-                    # Get metadata for this chunk
-                    # Slice rows first (more memory-efficient for backed mode), then select columns
-                    chunk_obs_slice = adata.obs.iloc[start_idx:end_idx]
-                    chunk_obs_data = {}
-                    for col in obs_columns:
-                        series_slice = chunk_obs_slice[col]
-                        chunk_obs_data[col] = _to_polars_compatible(series_slice)
-                    
-                    # Add cell_sentence column
-                    chunk_obs_data['cell_sentence'] = cell_sentences
+                    # Add all gene sentence columns from the results
+                    if chunk_sentence_results:
+                        sentence_keys = chunk_sentence_results[0].keys()
+                        for key in sentence_keys:
+                            chunk_obs_data[key] = [result[key] for result in chunk_sentence_results]
                     
                     # Create Polars DataFrame directly
                     chunk_df = pl.DataFrame(chunk_obs_data)
+                    cast_exprs = [
+                        pl.col(col).cast(dtype, strict=False)
+                        for col, dtype in obs_schema.items()
+                        if col in chunk_df.columns
+                    ]
+                    if cast_exprs:
+                        chunk_df = chunk_df.with_columns(cast_exprs)
+                    string_fill_exprs = [
+                        pl.col(col).fill_null("nan")
+                        for col, dtype in obs_schema.items()
+                        if dtype == pl.String and col in chunk_df.columns
+                    ]
+                    if string_fill_exprs:
+                        chunk_df = chunk_df.with_columns(string_fill_exprs)
                     # Add age column using Polars expression
                     chunk_df = extract_age_column(chunk_df)
                     
@@ -791,8 +878,8 @@ def convert_h5ad_to_parquet(
                         size_mb=round(file_size_mb, 2)
                     )
                     
-                    # Clear memory
-                    del chunk_X, cell_sentences, chunk_obs_data, chunk_df
+                # Clear memory
+                del chunk_sentence_results, chunk_obs_data, chunk_df
         
         adata.file.close()
         
@@ -937,20 +1024,24 @@ def convert_h5ad_to_train_test(
                       fallback="Will use var_names or feature_name from h5ad")
             use_hgnc = False
         
-        # Map genes to symbols using Polars
-        gene_symbols_list = map_genes_to_symbols_polars(adata, hgnc_df, use_hgnc=use_hgnc)
-        gene_symbols = np.array(gene_symbols_list, dtype=object)
+        # Map genes to symbols using Polars (returns numpy array directly)
+        gene_symbols = map_genes_to_symbols_polars(adata, hgnc_df, use_hgnc=use_hgnc)
+        # Clear HGNC DataFrame to free memory (no longer needed)
+        if hgnc_df is not None:
+            del hgnc_df
         
         # Load gene lists if provided
-        gene_list_filter: Optional[set[str]] = None
+        gene_list_filter: Optional[dict[str, set[str]]] = None
         if gene_lists_dir is not None:
             if gene_lists_dir.exists():
                 gene_list_filter = load_gene_lists(gene_lists_dir)
                 if gene_list_filter:
+                    total_genes_across_all_lists = sum(len(genes) for genes in gene_list_filter.values())
                     action.log(
                         message_type="gene_list_filter_enabled",
-                        total_genes_in_filter=len(gene_list_filter),
-                        will_create_full_gene_sentence=True,
+                        num_gene_lists=len(gene_list_filter),
+                        gene_list_names=list(gene_list_filter.keys()),
+                        total_genes_across_all_lists=total_genes_across_all_lists,
                         gene_lists_dir=str(gene_lists_dir)
                     )
                 else:
@@ -1051,16 +1142,11 @@ def convert_h5ad_to_train_test(
                 note="join_collection=False, skipping collection joining and dataset_id column"
             )
         
-        # Get column names from obs once (outside loop)
-        obs_columns = list(adata.obs.columns)
-        
-        # Helper: ensure Polars-compatible arrays
-        def _to_polars_compatible(values) -> np.ndarray:
-            dtype_name = getattr(values, "dtype", None)
-            dtype_name = getattr(dtype_name, "name", None)
-            if dtype_name == "category":
-                return values.astype(str).to_numpy()
-            return values.to_numpy() if hasattr(values, "to_numpy") else np.asarray(values, dtype=object)
+        obs_group = adata.file["obs"]
+        obs_columns = list_obs_columns_from_group(obs_group)
+        obs_schema = infer_obs_schema(obs_group)
+        string_fields = {col for col, dtype in obs_schema.items() if dtype == pl.String}
+        categorical_cache: dict[str, np.ndarray] = {}
         
         n_cells = adata.n_obs
         n_chunks = (n_cells + chunk_size - 1) // chunk_size
@@ -1092,46 +1178,51 @@ def convert_h5ad_to_train_test(
                 start_idx = chunk_idx * chunk_size
                 end_idx = min(start_idx + chunk_size, n_cells)
                 
-                # Read chunk of expression matrix
-                chunk_X = adata.X[start_idx:end_idx].toarray()
+                # Create cell sentences for each cell in chunk without materializing a large dense block.
+                # This keeps memory bounded even for very wide matrices or very large h5ad files.
+                sentence_results: list[dict[str, str]] = []
+                for row_idx in range(start_idx, end_idx):
+                    cell_row = adata.X[row_idx]
+                    if hasattr(cell_row, "toarray"):
+                        cell_expr = cell_row.toarray().ravel()
+                    else:
+                        cell_expr = np.asarray(cell_row).ravel()
+                    sentence_results.append(
+                        create_cell_sentence(
+                            cell_expr,
+                            gene_symbols,
+                            top_genes,
+                            gene_lists=gene_list_filter,
+                        )
+                    )
                 
-                # Create cell sentences for each cell in chunk
-                if gene_list_filter:
-                    # Create both filtered and full sentences
-                    sentence_results = [
-                        create_cell_sentence(cell_expr, gene_symbols, top_genes, 
-                                           gene_list_filter=gene_list_filter, 
-                                           return_full_sentence=True)
-                        for cell_expr in chunk_X
-                    ]
-                    # Unpack into two lists
-                    cell_sentences = [result[0] for result in sentence_results]
-                    full_gene_sentences = [result[1] for result in sentence_results]
-                else:
-                    # Standard processing without gene list filter
-                    cell_sentences = [
-                        create_cell_sentence(cell_expr, gene_symbols, top_genes)
-                        for cell_expr in chunk_X
-                    ]
-                    full_gene_sentences = None
+                chunk_obs_data = read_obs_chunk_dict(
+                    obs_group=obs_group,
+                    fields=obs_columns,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    categorical_cache=categorical_cache,
+                    as_lists=False,
+                    string_fields=string_fields,
+                    string_fill_value="nan"
+                )
                 
-                # Build chunk data with all metadata
-                # Slice rows first (more memory-efficient for backed mode), then select columns
-                chunk_obs_slice = adata.obs.iloc[start_idx:end_idx]
-                chunk_obs_data = {}
-                for col in obs_columns:
-                    series_slice = chunk_obs_slice[col]
-                    chunk_obs_data[col] = _to_polars_compatible(series_slice)
-                
-                # Add cell_sentence column
-                chunk_obs_data['cell_sentence'] = cell_sentences
-                
-                # Add full_gene_sentence column if gene list filter is enabled
-                if full_gene_sentences is not None:
-                    chunk_obs_data['full_gene_sentence'] = full_gene_sentences
+                # Add all gene sentence columns from the results
+                # Extract keys from first result to know which columns to create
+                if sentence_results:
+                    sentence_keys = sentence_results[0].keys()
+                    for key in sentence_keys:
+                        chunk_obs_data[key] = [result[key] for result in sentence_results]
                 
                 # Create Polars DataFrame
                 chunk_df = pl.DataFrame(chunk_obs_data)
+                cast_exprs = [
+                    pl.col(col).cast(dtype, strict=False)
+                    for col, dtype in obs_schema.items()
+                    if col in chunk_df.columns
+                ]
+                if cast_exprs:
+                    chunk_df = chunk_df.with_columns(cast_exprs)
                 
                 # Extract age using vectorized Polars regex (much faster than map_elements)
                 chunk_df = extract_age_column(chunk_df)
@@ -1145,6 +1236,34 @@ def convert_h5ad_to_train_test(
                 # Join with collections to add publication metadata
                 if should_join_collections:
                     chunk_df = join_with_collections(chunk_df, cache_dir=None)
+                    collection_casts = [
+                        pl.col(col).cast(pl.String, strict=False)
+                        for col in [
+                            "collection_id",
+                            "publication_title",
+                            "publication_doi",
+                            "publication_description",
+                            "publication_contact_name",
+                            "publication_contact_email",
+                        ]
+                        if col in chunk_df.columns
+                    ]
+                    if collection_casts:
+                        chunk_df = chunk_df.with_columns(collection_casts)
+                    collection_fill_exprs = [
+                        pl.col(col).fill_null("nan")
+                        for col in [
+                            "collection_id",
+                            "publication_title",
+                            "publication_doi",
+                            "publication_description",
+                            "publication_contact_name",
+                            "publication_contact_email",
+                        ]
+                        if col in chunk_df.columns
+                    ]
+                    if collection_fill_exprs:
+                        chunk_df = chunk_df.with_columns(collection_fill_exprs)
                 
                 if 'development_stage' not in chunk_df.columns:
                     chunk_action.log(message_type="warning_no_development_stage",
@@ -1243,6 +1362,7 @@ def convert_h5ad_to_train_test(
                                            rows=len(train_df_combined))
                             train_chunk_idx += 1
                             train_buffer = []
+                            del train_df_combined
                     
                     if test_chunk.height > 0:
                         test_buffer.append(test_chunk)
@@ -1264,9 +1384,15 @@ def convert_h5ad_to_train_test(
                                            rows=len(test_df_combined))
                             test_chunk_idx += 1
                             test_buffer = []
+                            del test_df_combined
                 
                 # Clear memory
-                del chunk_X, cell_sentences, chunk_obs_data, chunk_df
+                del sentence_results, chunk_obs_data, chunk_df
+                # Also clear train/test chunks if they exist
+                if 'train_chunk' in locals():
+                    del train_chunk
+                if 'test_chunk' in locals():
+                    del test_chunk
         
         # Flush remaining buffers
         if not skip_train_test_split:
@@ -1283,6 +1409,7 @@ def convert_h5ad_to_train_test(
                           output_file=str(output_file),
                           rows=len(train_df_combined))
                 train_chunk_idx += 1
+                del train_df_combined
             
             if test_buffer:
                 test_df_combined = pl.concat(test_buffer)
@@ -1297,6 +1424,7 @@ def convert_h5ad_to_train_test(
                           output_file=str(output_file),
                           rows=len(test_df_combined))
                 test_chunk_idx += 1
+                del test_df_combined
         
         adata.file.close()
         

@@ -20,6 +20,17 @@ from cell2sentence4longevity.preprocessing import (
 class TestIntegrationPipeline:
     """Integration tests for the full preprocessing pipeline."""
     
+    @staticmethod
+    def _get_sentence_column(columns: list[str]) -> str | None:
+        """Return whichever gene sentence column exists in the dataset."""
+        preferred_columns = [
+            "gene_sentence_2000",
+            "gene_sentence_all",
+            "cell_sentence",
+            "cell2sentence",
+        ]
+        return next((col for col in preferred_columns if col in columns), None)
+    
     @pytest.fixture
     def temp_dirs(self) -> dict[str, Path]:
         """Create test directories using project's data/ structure.
@@ -161,8 +172,9 @@ class TestIntegrationPipeline:
                 columns=sample_df.columns,
                 rows=len(sample_df)
             )
-            assert 'cell_sentence' in sample_df.columns or 'cell2sentence' in sample_df.columns, \
-                "Should have cell_sentence or cell2sentence column"
+            sample_sentence_column = self._get_sentence_column(sample_df.columns)
+            assert sample_sentence_column is not None, \
+                "Should have at least one gene sentence column (gene_sentence_2000, gene_sentence_all, cell_sentence, or cell2sentence)"
             
             # Validate age column was added during conversion
             assert 'age' in sample_df.columns, "Should have age column (added during conversion)"
@@ -212,7 +224,10 @@ class TestIntegrationPipeline:
             final_train_sample = pl.scan_parquet(train_dir / "*.parquet").limit(100).collect()
             final_test_sample = pl.scan_parquet(test_dir / "*.parquet").limit(100).collect()
             
-            assert 'cell_sentence' in final_train_sample.columns, "Final data should have cell_sentence"
+            final_sentence_column = self._get_sentence_column(final_train_sample.columns)
+            assert final_sentence_column is not None, "Final data should have a gene sentence column"
+            test_sentence_column = self._get_sentence_column(final_test_sample.columns)
+            assert test_sentence_column is not None, "Test data should have a gene sentence column"
             assert 'age' in final_train_sample.columns, "Final data should have age"
             
             # Validate dataset_id column was added (join_collection=True)
@@ -276,19 +291,19 @@ class TestIntegrationPipeline:
                 )
 
             
-            # Check cell_sentence is not empty
-            non_empty_sentences = final_train_sample['cell_sentence'].str.len_chars() > 0
-            assert non_empty_sentences.sum() > 0, "Should have non-empty cell sentences"
+            # Check cell sentences are not empty
+            non_empty_sentences = final_train_sample[final_sentence_column].str.len_chars() > 0
+            assert non_empty_sentences.sum() > 0, "Should have non-empty gene sentences"
             
             # Check that no Ensembl IDs are present in cell sentences (train set)
             # Ensembl IDs start with "ENS" (e.g., ENSG00000139618, ENST00000361390)
-            has_ensembl_ids_train = final_train_sample['cell_sentence'].str.contains(r'\bENS[A-Z]*\d+')
+            has_ensembl_ids_train = final_train_sample[final_sentence_column].str.contains(r'\bENS[A-Z]*\d+')
             ensembl_id_count_train = has_ensembl_ids_train.sum()
             assert ensembl_id_count_train == 0, \
                 f"Train sentences should not contain Ensembl IDs, found {ensembl_id_count_train} sentences with Ensembl IDs"
             
             # Check that no Ensembl IDs are present in cell sentences (test set)
-            has_ensembl_ids_test = final_test_sample['cell_sentence'].str.contains(r'\bENS[A-Z]*\d+')
+            has_ensembl_ids_test = final_test_sample[test_sentence_column].str.contains(r'\bENS[A-Z]*\d+')
             ensembl_id_count_test = has_ensembl_ids_test.sum()
             assert ensembl_id_count_test == 0, \
                 f"Test sentences should not contain Ensembl IDs, found {ensembl_id_count_test} sentences with Ensembl IDs"
@@ -354,7 +369,7 @@ class TestIntegrationPipeline:
             test_action.log(
                 message_type="final_structure_validated",
                 columns=final_train_sample.columns,
-                sample_sentence=final_train_sample['cell_sentence'][0][:100]
+                sample_sentence=final_train_sample[final_sentence_column][0][:100]
             )
             
             # Validate logs were written properly
