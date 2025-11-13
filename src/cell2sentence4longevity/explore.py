@@ -454,7 +454,12 @@ def extract(
         rendered_log = log_dir / "extract.log"
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
     else:
-        to_nice_stdout(output_file=Path("./extract.json"))
+        # Default to ./logs directory
+        default_log_dir = Path("./logs")
+        default_log_dir.mkdir(parents=True, exist_ok=True)
+        json_log = default_log_dir / "extract.json"
+        rendered_log = default_log_dir / "extract.log"
+        to_nice_file(output_file=json_log, rendered_file=rendered_log)
     
     # Determine output path
     if output_path is None:
@@ -510,6 +515,7 @@ def batch(
     summary_format: str = typer.Option("csv", "--summary-format", help="Format for summary files: 'csv' or 'tsv' (default: csv)"),
     log_dir: Optional[Path] = typer.Option(None, "--log-dir", help="Directory for log files"),
     skip_existing: bool = typer.Option(True, "--skip-existing/--overwrite", help="Skip files that already have output"),
+    max_threads: Optional[int] = typer.Option(None, "--max-threads", help="Maximum number of threads for Polars (default: 8, set to 1 for minimal memory)"),
 ) -> None:
     """Extract metadata fields from multiple h5ad files in batch.
     
@@ -526,6 +532,17 @@ def batch(
         # Specify custom output directory
         explore batch ./data/input --output-dir ./custom/output
     """
+    # Limit Polars thread pool to prevent memory overload with many files
+    # Use half of available cores by default to balance speed and memory
+    import os
+    if max_threads is not None:
+        threads = max_threads
+    else:
+        cpu_count = os.cpu_count() or 4
+        threads = max(1, cpu_count // 2)  # Half of cores, minimum 1
+    os.environ['POLARS_MAX_THREADS'] = str(threads)
+    typer.echo(f"Using {threads} threads for Polars operations")
+    
     # Determine output directory
     if output_dir is None:
         output_dir = Path("data/output/meta")
@@ -537,7 +554,12 @@ def batch(
         rendered_log = log_dir / "batch_extract.log"
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
     else:
-        to_nice_stdout(output_file=Path("./batch_extract.json"))
+        # Default to ./logs directory
+        default_log_dir = Path("./logs")
+        default_log_dir.mkdir(parents=True, exist_ok=True)
+        json_log = default_log_dir / "batch_extract.json"
+        rendered_log = default_log_dir / "batch_extract.log"
+        to_nice_file(output_file=json_log, rendered_file=rendered_log)
     
     with start_action(
         action_type="batch_extract_fields",
