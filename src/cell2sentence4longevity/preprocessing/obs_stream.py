@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Sequence, Set
 
 import h5py
 import numpy as np
 import polars as pl
+
+from anndata._io.specs import read_elem
 
 
 def _decode_scalar(value: Any) -> Any:
@@ -106,6 +108,28 @@ def _fill_string_array(arr: np.ndarray, fill_value: str) -> np.ndarray:
     return arr
 
 
+def _normalize_preloaded_column(values: Any) -> np.ndarray | list[Any]:
+    if isinstance(values, np.ndarray):
+        return values
+    if hasattr(values, "to_numpy"):
+        return values.to_numpy()
+    if hasattr(values, "to_list"):
+        return values.to_list()
+    if hasattr(values, "tolist"):
+        return values.tolist()
+    return np.asarray(values, dtype=object)
+
+
+def _slice_preloaded_column(
+    data: np.ndarray | Sequence[Any],
+    start_idx: int,
+    end_idx: int
+) -> Any:
+    if isinstance(data, np.ndarray):
+        return data[start_idx:end_idx]
+    return data[start_idx:end_idx]
+
+
 def read_obs_chunk_dict(
     obs_group: h5py.Group,
     fields: list[str],
@@ -115,27 +139,40 @@ def read_obs_chunk_dict(
     as_lists: bool = False,
     string_fields: Set[str] | None = None,
     string_fill_value: str | None = None,
+    preloaded_fields: Dict[str, np.ndarray | Sequence[Any]] | None = None,
 ) -> dict[str, Any]:
     if categorical_cache is None:
         categorical_cache = {}
+    if preloaded_fields is None:
+        preloaded_fields = {}
     chunk_data: dict[str, Any] = {}
     for field in fields:
-        node = obs_group.get(field)
-        if node is None:
-            msg = f"Field '{field}' not found in obs group"
-            raise KeyError(msg)
-        values = _read_obs_field_slice(
-            node,
-            field,
-            start_idx,
-            end_idx,
-            categorical_cache
-        )
+        if field in preloaded_fields:
+            values = _slice_preloaded_column(
+                preloaded_fields[field],
+                start_idx,
+                end_idx
+            )
+        else:
+            node = obs_group.get(field)
+            if node is None:
+                msg = f"Field '{field}' not found in obs group"
+                raise KeyError(msg)
+            values = _read_obs_field_slice(
+                node,
+                field,
+                start_idx,
+                end_idx,
+                categorical_cache
+            )
         is_string_field = string_fields is not None and field in string_fields
         if not as_lists or is_string_field:
             values = _ensure_numpy_array(values)
-        if is_string_field and string_fill_value is not None:
-            values = _fill_string_array(values, string_fill_value)
+        if is_string_field:
+            if string_fill_value is not None:
+                values = _fill_string_array(values, string_fill_value)
+            values_list = values.tolist()
+            values = pl.Series(field, values_list, dtype=pl.String)
         if as_lists:
             if isinstance(values, np.ndarray):
                 values = values.tolist()
@@ -152,7 +189,8 @@ def build_obs_chunk_dataframe(
     end_idx: int,
     categorical_cache: Dict[str, np.ndarray] | None = None,
     string_fields: Set[str] | None = None,
-    string_fill_value: str | None = None
+    string_fill_value: str | None = None,
+    preloaded_fields: Dict[str, np.ndarray | Sequence[Any]] | None = None,
 ) -> pl.DataFrame:
     chunk_dict = read_obs_chunk_dict(
         obs_group=obs_group,
@@ -162,9 +200,32 @@ def build_obs_chunk_dataframe(
         categorical_cache=categorical_cache,
         as_lists=False,
         string_fields=string_fields,
-        string_fill_value=string_fill_value
+        string_fill_value=string_fill_value,
+        preloaded_fields=preloaded_fields
     )
     return pl.DataFrame(chunk_dict)
+
+
+def preload_complex_obs_fields(
+    obs_group: h5py.Group,
+    fields: list[str]
+) -> dict[str, np.ndarray | list[Any]]:
+    preloaded: dict[str, np.ndarray | list[Any]] = {}
+    for field in fields:
+        node = obs_group.get(field)
+        if node is None:
+            continue
+        encoding_type = node.attrs.get("encoding-type", "array")
+        is_dataset = isinstance(node, h5py.Dataset)
+        if is_dataset or encoding_type == "categorical":
+            continue
+        try:
+            values = read_elem(node)
+        except Exception as exc:
+            msg = f"Failed to preload obs field '{field}': {exc}"
+            raise RuntimeError(msg) from exc
+        preloaded[field] = _normalize_preloaded_column(values)
+    return preloaded
 
 
 def list_obs_columns_from_group(obs_group: h5py.Group) -> list[str]:
@@ -185,6 +246,15 @@ def infer_obs_schema(obs_group: h5py.Group) -> dict[str, pl.datatypes.DataType]:
             continue
         encoding_type = node.attrs.get("encoding-type", "array")
         if encoding_type in {"categorical", "string-array"}:
+            schema[name] = pl.String
+            continue
+        if encoding_type == "nullable-boolean":
+            schema[name] = pl.Boolean
+            continue
+        if encoding_type == "nullable-integer":
+            schema[name] = pl.Int64
+            continue
+        if encoding_type == "nullable-string-array":
             schema[name] = pl.String
             continue
         if not isinstance(node, h5py.Dataset):

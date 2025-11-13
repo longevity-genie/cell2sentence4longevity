@@ -18,9 +18,86 @@ from cell2sentence4longevity.preprocessing.obs_stream import (
     infer_obs_schema,
     list_obs_columns_from_file,
     list_obs_columns_from_group,
+    preload_complex_obs_fields,
 )
 
 app = typer.Typer(help="Extract metadata fields from h5ad AnnData files")
+
+
+MAX_LOG_VALUE_LENGTH = 200
+MAX_SAMPLE_ROWS = 5
+MAX_NESTED_ITEMS = 8
+
+
+def _coerce_all_null_object_columns(
+    df: pl.DataFrame,
+    obs_schema: dict[str, pl.DataType]
+) -> pl.DataFrame:
+    if not df.columns:
+        return df
+    replacements: list[pl.Expr] = []
+    for column_name, dtype in df.schema.items():
+        if dtype != pl.Object:
+            continue
+        if column_name not in obs_schema:
+            continue
+        series = df[column_name]
+        if series.is_null().all():
+            target_dtype = obs_schema[column_name]
+            replacements.append(pl.lit(None, dtype=target_dtype).alias(column_name))
+    if not replacements:
+        return df
+    return df.with_columns(replacements)
+
+
+def _truncate_for_log(value: str) -> str:
+    if len(value) <= MAX_LOG_VALUE_LENGTH:
+        return value
+    return f"{value[:MAX_LOG_VALUE_LENGTH]}...[truncated]"
+
+
+def _safe_serialize_for_log(value: Any, *, max_items: int = MAX_NESTED_ITEMS) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _truncate_for_log(value)
+    if isinstance(value, (bytes, bytearray)):
+        decoded = value.decode("utf-8", errors="replace")
+        return _truncate_for_log(decoded)
+    if isinstance(value, dict):
+        limited_items = list(value.items())[:max_items]
+        return {
+            str(k): _safe_serialize_for_log(v, max_items=max_items)
+            for k, v in limited_items
+        }
+    if isinstance(value, (list, tuple, set)):
+        limited_values = list(value)[:max_items]
+        return [_safe_serialize_for_log(v, max_items=max_items) for v in limited_values]
+    if hasattr(value, "tolist"):
+        try:
+            data_list = value.tolist()
+            return _safe_serialize_for_log(data_list, max_items=max_items)
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    representation = repr(value)
+    return _truncate_for_log(representation)
+
+
+def _collect_sample_rows(df: pl.DataFrame, max_rows: int = MAX_SAMPLE_ROWS) -> list[dict[str, Any]]:
+    if df.height == 0:
+        return []
+    sample_rows: list[dict[str, Any]] = []
+    for row in df.head(max_rows).iter_rows(named=True):
+        serialized_row = {column: _safe_serialize_for_log(value) for column, value in row.items()}
+        sample_rows.append(serialized_row)
+    return sample_rows
 
 
 def extract_fields_from_h5ad(
@@ -63,6 +140,15 @@ def extract_fields_from_h5ad(
         obs_schema = infer_obs_schema(obs_group)
         string_fields = {col for col, dtype in obs_schema.items() if dtype == pl.String}
         requested_fields = fields if fields is not None else obs_columns
+        preloaded_fields = preload_complex_obs_fields(
+            obs_group=obs_group,
+            fields=[field for field in requested_fields if field in obs_columns]
+        )
+        if preloaded_fields:
+            action.log(
+                message_type="preloaded_complex_obs_fields",
+                fields=list(preloaded_fields.keys())
+            )
         
         action.log(
             message_type="h5ad_loaded",
@@ -109,55 +195,85 @@ def extract_fields_from_h5ad(
                 start_idx = chunk_idx * chunk_size
                 end_idx = min(start_idx + chunk_size, n_cells)
                 
-                chunk_df = build_obs_chunk_dataframe(
-                    obs_group=obs_group,
-                    fields=valid_fields,
-                    start_idx=start_idx,
-                    end_idx=end_idx,
-                    categorical_cache=categorical_cache,
-                    string_fields=string_fields,
-                    string_fill_value=None
-                )
+                chunk_df: pl.DataFrame | None = None
+                chunk_columns: list[str] = []
                 
-                cast_exprs = [
-                    pl.col(col).cast(dtype, strict=False)
-                    for col, dtype in obs_schema.items()
-                    if col in chunk_df.columns
-                ]
-                if cast_exprs:
-                    chunk_df = chunk_df.with_columns(cast_exprs)
-                fill_exprs = [
-                    pl.col(col).fill_null("nan")
-                    for col, dtype in obs_schema.items()
-                    if dtype == pl.String and col in chunk_df.columns
-                ]
-                if fill_exprs:
-                    chunk_df = chunk_df.with_columns(fill_exprs)
-                
-                if extract_age:
-                    chunk_df = extract_age_columns(
-                        chunk_df,
-                        development_stage_col=age_source_col
+                try:
+                    chunk_df = build_obs_chunk_dataframe(
+                        obs_group=obs_group,
+                        fields=valid_fields,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        categorical_cache=categorical_cache,
+                        string_fields=string_fields,
+                    string_fill_value=None,
+                    preloaded_fields=preloaded_fields
                     )
-                
-                # Write chunk to temp file
-                chunk_file = temp_dir / f"chunk_{chunk_idx:04d}.parquet"
-                chunk_df.write_parquet(
-                    chunk_file,
-                    compression=compression,
-                    compression_level=compression_level,
-                    use_pyarrow=use_pyarrow
-                )
-                
-                # Clean up chunk data immediately
-                del chunk_df
-                
-                chunk_action.log(
-                    message_type="chunk_processed",
-                    rows=end_idx - start_idx,
-                    start_idx=start_idx,
-                    end_idx=end_idx
-                )
+                    chunk_df = _coerce_all_null_object_columns(chunk_df, obs_schema)
+                    
+                    chunk_columns = list(chunk_df.columns)
+                    
+                    cast_exprs = [
+                        pl.col(col).cast(dtype, strict=False)
+                        for col, dtype in obs_schema.items()
+                        if col in chunk_columns
+                    ]
+                    if cast_exprs:
+                        chunk_df = chunk_df.with_columns(cast_exprs)
+                    fill_exprs = [
+                        pl.col(col).fill_null("nan")
+                        for col, dtype in obs_schema.items()
+                        if dtype == pl.String and col in chunk_columns
+                    ]
+                    if fill_exprs:
+                        chunk_df = chunk_df.with_columns(fill_exprs)
+                    
+                    if extract_age:
+                        chunk_df = extract_age_columns(
+                            chunk_df,
+                            development_stage_col=age_source_col
+                        )
+                    
+                    # Write chunk to temp file
+                    chunk_file = temp_dir / f"chunk_{chunk_idx:04d}.parquet"
+                    chunk_df.write_parquet(
+                        chunk_file,
+                        compression=compression,
+                        compression_level=compression_level,
+                        use_pyarrow=use_pyarrow
+                    )
+                    
+                    chunk_action.log(
+                        message_type="chunk_processed",
+                        rows=end_idx - start_idx,
+                        start_idx=start_idx,
+                        end_idx=end_idx
+                    )
+                    
+                    chunk_df = None
+                except Exception as exc:
+                    sample_rows: list[dict[str, Any]] = []
+                    if chunk_df is not None:
+                        try:
+                            sample_rows = _collect_sample_rows(chunk_df)
+                        except Exception as sample_exc:
+                            sample_rows = [
+                                {
+                                    "_error": f"Failed to serialize sample rows: {sample_exc}"
+                                }
+                            ]
+                    chunk_action.log(
+                        message_type="chunk_failure_sample",
+                        error=str(exc),
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        columns=chunk_columns,
+                        sample_rows=sample_rows
+                    )
+                    raise
+                finally:
+                    if chunk_df is not None:
+                        del chunk_df
         
         # Read all chunks lazily without materializing full dataset
         action.log(message_type="building_lazy_dataframe", n_chunks=n_chunks)
