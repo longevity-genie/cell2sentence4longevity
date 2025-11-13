@@ -1,6 +1,6 @@
 [project]
 name = "cell2sentence4longevity"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cell to sentence preprocessing pipeline for longevity research"
 readme = "README.md"
 authors = [
@@ -34,6 +34,7 @@ dev = [
 
 [project.scripts]
 preprocess = "cell2sentence4longevity.preprocess:main"
+explore = "cell2sentence4longevity.explore:app"
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]

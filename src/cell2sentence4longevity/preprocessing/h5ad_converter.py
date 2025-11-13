@@ -15,8 +15,122 @@ from tqdm import tqdm
 import polars as pl
 
 
+def extract_age_columns(df: pl.DataFrame, development_stage_col: str = 'development_stage') -> pl.DataFrame:
+    """Extract age in years (for humans) and age in months (for mice) using Polars regex.
+    
+    This function handles different age formats:
+    - For humans: extracts from patterns like "22-year-old" or "22.5-year-old" -> age_years
+    - For mice: extracts from patterns like "24m", "24 month", "2.5m" -> age_months
+    - Also checks for existing 'age' field (common in mouse datasets) -> age_months
+    
+    Only adds the age column relevant to the species (age_years for humans, age_months for mice).
+    
+    This is much faster than using map_elements as it's fully vectorized.
+    
+    Args:
+        df: Polars DataFrame
+        development_stage_col: Name of the column containing development stage info
+        
+    Returns:
+        DataFrame with added 'age_years' (for humans) or 'age_months' (for mice) column (Float64)
+    """
+    result_df = df
+    
+    # Check if organism column exists to determine species
+    has_organism = 'organism' in df.columns
+    
+    if not has_organism:
+        # If no organism column, add both columns as we don't know the species
+        result_df = result_df.with_columns([
+            pl.lit(None).cast(pl.Float64).alias('age_years'),
+            pl.lit(None).cast(pl.Float64).alias('age_months')
+        ])
+        
+        # Try to extract from both patterns
+        if development_stage_col in df.columns:
+            result_df = result_df.with_columns([
+                pl.col(development_stage_col)
+                .str.extract(r'(\d+(?:\.\d+)?)-year-old', 1)
+                .cast(pl.Float64, strict=False)
+                .alias('age_years'),
+                pl.col(development_stage_col)
+                .str.extract(r'(\d+(?:\.\d+)?)\s*-?\s*m(?:onth)?', 1)
+                .cast(pl.Float64, strict=False)
+                .alias('age_months')
+            ])
+        
+        # Check for existing 'age' field
+        if 'age' in df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('age_months').is_null())
+                .then(pl.col('age').cast(pl.Float64, strict=False))
+                .otherwise(pl.col('age_months'))
+                .alias('age_months')
+            )
+        
+        return result_df
+    
+    # Determine if we have humans, mice, or mixed
+    organisms = df.select('organism').unique().to_series()
+    has_humans = (organisms == 'Homo sapiens').any()
+    has_mice = (organisms == 'Mus musculus').any()
+    
+    # Extract human age (years) - only if humans present
+    if has_humans:
+        result_df = result_df.with_columns(
+            pl.lit(None).cast(pl.Float64).alias('age_years')
+        )
+        
+        if development_stage_col in df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('organism') == 'Homo sapiens')
+                .then(
+                    pl.col(development_stage_col)
+                    .str.extract(r'(\d+(?:\.\d+)?)-year-old', 1)
+                    .cast(pl.Float64, strict=False)
+                )
+                .otherwise(pl.col('age_years'))
+                .alias('age_years')
+            )
+    
+    # Extract mouse age (months) - only if mice present
+    if has_mice:
+        result_df = result_df.with_columns(
+            pl.lit(None).cast(pl.Float64).alias('age_months')
+        )
+        
+        if development_stage_col in df.columns:
+            # Pattern matches "24m", "24 month", "24-month", "2.5m", etc.
+            result_df = result_df.with_columns(
+                pl.when(pl.col('organism') == 'Mus musculus')
+                .then(
+                    pl.col(development_stage_col)
+                    .str.extract(r'(\d+(?:\.\d+)?)\s*-?\s*m(?:onth)?', 1)
+                    .cast(pl.Float64, strict=False)
+                )
+                .otherwise(pl.col('age_months'))
+                .alias('age_months')
+            )
+        
+        # Check for existing 'age' field (common in mouse datasets)
+        if 'age' in df.columns:
+            result_df = result_df.with_columns(
+                pl.when(
+                    (pl.col('organism') == 'Mus musculus') & 
+                    (pl.col('age_months').is_null())
+                )
+                .then(pl.col('age').cast(pl.Float64, strict=False))
+                .otherwise(pl.col('age_months'))
+                .alias('age_months')
+            )
+    
+    return result_df
+
+
 def extract_age_column(df: pl.DataFrame, source_col: str = 'development_stage') -> pl.DataFrame:
-    """Extract age in years from development_stage column using Polars regex.
+    """Legacy function for backward compatibility. Extract age in years from development_stage column.
+    
+    DEPRECATED: Use extract_age_columns() instead for better human/mouse support.
     
     This is much faster than using map_elements as it's fully vectorized.
     
@@ -39,6 +153,7 @@ def extract_age_column(df: pl.DataFrame, source_col: str = 'development_stage') 
         .cast(pl.Float64, strict=False)  # Cast to float, null if not a number
         .alias('age')
     )
+
 
 
 def has_gene_symbols(adata: ad.AnnData) -> bool:
@@ -297,7 +412,7 @@ def map_genes_to_symbols_polars(
         return gene_symbols
 
 
-def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n: int = 2000) -> str:
+def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n: Optional[int] = 2000) -> str:
     """Create cell sentence from expression data.
     
     Uses argpartition for faster top-k selection (O(n) vs O(n log n) for full sort).
@@ -306,8 +421,8 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
     Args:
         cell_expr: Expression values for a single cell
         gene_symbols: Array of gene symbols corresponding to expression values
-        top_n: Number of top genes to include in sentence
-        
+        top_n: Number of top genes to include in sentence. If None, uses all valid genes.
+    
     Returns:
         Space-separated string of top expressed genes (excluding Ensembl IDs)
     """
@@ -330,7 +445,8 @@ def create_cell_sentence(cell_expr: np.ndarray, gene_symbols: np.ndarray, top_n:
     
     # Use argpartition for faster top-k selection (much faster than full sort)
     # Get indices of top N expressed genes from valid genes
-    if top_n >= len(valid_expr):
+    # If top_n is None, use all genes
+    if top_n is None or top_n >= len(valid_expr):
         top_gene_indices = np.argsort(valid_expr)[::-1]
     else:
         # argpartition is O(n) vs argsort which is O(n log n)
@@ -350,7 +466,7 @@ def convert_h5ad_to_parquet(
     chunk_size: int | None = None,
     target_mb: float | None = None,
     dataset_name: str | None = None,
-    top_genes: int = 2000,
+    top_genes: Optional[int] = 2000,
     compression: str = "zstd",
     compression_level: int = 3,
     use_pyarrow: bool = True
@@ -363,7 +479,7 @@ def convert_h5ad_to_parquet(
         chunk_size: Number of cells per chunk (used if target_mb is None). Default: None (uses target_mb)
         target_mb: Target size per chunk in MB (used if chunk_size is None). Default: None (uses chunk_size=2500)
         dataset_name: Name of the dataset for folder organization. If None, uses h5ad filename stem
-        top_genes: Number of top expressed genes per cell
+        top_genes: Number of top expressed genes per cell. If None, uses all valid genes.
         compression: Compression algorithm for parquet files. Options: "uncompressed", "snappy", 
                      "gzip", "lzo", "brotli", "lz4", "zstd". Default: "zstd" (good balance)
         compression_level: Compression level (1-9 for zstd/gzip, 1-11 for brotli). Default: 3
@@ -487,9 +603,11 @@ def convert_h5ad_to_parquet(
                 ]
                 
                 # Get metadata for batch
+                # Slice rows first (more memory-efficient for backed mode), then select columns
+                batch_obs_slice = adata.obs.iloc[cell_idx:batch_end]
                 batch_obs_data = {}
                 for col in obs_columns:
-                    series_slice = adata.obs[col].iloc[cell_idx:batch_end]
+                    series_slice = batch_obs_slice[col]
                     batch_obs_data[col] = _to_polars_compatible(series_slice)
                 batch_obs_data['cell_sentence'] = batch_sentences
                 
@@ -569,9 +687,11 @@ def convert_h5ad_to_parquet(
                     
                     # Build Polars DataFrame directly from obs data (skip pandas intermediate)
                     # Get metadata for this chunk
+                    # Slice rows first (more memory-efficient for backed mode), then select columns
+                    chunk_obs_slice = adata.obs.iloc[start_idx:end_idx]
                     chunk_obs_data = {}
                     for col in obs_columns:
-                        series_slice = adata.obs[col].iloc[start_idx:end_idx]
+                        series_slice = chunk_obs_slice[col]
                         chunk_obs_data[col] = _to_polars_compatible(series_slice)
                     
                     # Add cell_sentence column
@@ -629,7 +749,7 @@ def convert_h5ad_to_train_test(
     output_dir: Path = Path("./output"),
     dataset_name: str | None = None,
     chunk_size: int = 10000,
-    top_genes: int = 2000,
+    top_genes: Optional[int] = 2000,
     test_size: float = 0.05,
     random_state: int = 42,
     compression: str = "zstd",
@@ -637,7 +757,8 @@ def convert_h5ad_to_train_test(
     use_pyarrow: bool = True,
     skip_train_test_split: bool = False,
     stratify_by_age: bool = True,
-    join_collection: bool = True
+    join_collection: bool = True,
+    filter_by_age: bool = True
 ) -> None:
     """Convert h5ad file directly to train/test parquet splits in one streaming pass.
     
@@ -657,12 +778,17 @@ def convert_h5ad_to_train_test(
     - Only joins with collections metadata if dataset is found in collections cache
     - If join_collection=False, skips collection joining entirely and does not add dataset_id column
     
+    Age filtering behavior:
+    - By default (filter_by_age=True), filters out cells with null age values
+    - If filter_by_age=False, keeps all cells regardless of age (useful for datasets without age information)
+    - When stratify_by_age=True, filtering is still required for stratification to work properly
+    
     Args:
         h5ad_path: Path to the h5ad file
         output_dir: Directory to save train/test splits
         dataset_name: Name of the dataset for folder organization. If None, uses h5ad filename stem
         chunk_size: Number of cells per chunk
-        top_genes: Number of top expressed genes per cell
+        top_genes: Number of top expressed genes per cell. If None, uses all valid genes.
         test_size: Proportion of data for test set (0.0 to 1.0)
         random_state: Random seed for reproducibility
         compression: Compression algorithm for parquet files
@@ -671,6 +797,7 @@ def convert_h5ad_to_train_test(
         skip_train_test_split: If True, writes all data to output_dir without splitting
         stratify_by_age: If True, maintains age distribution in train/test splits (default: True)
         join_collection: If True (default), auto-detects cellxgene datasets and always adds dataset_id column. Only joins with collections metadata if dataset is found in collections cache. If False, skips collection joining and does not add dataset_id column.
+        filter_by_age: If True (default), filters out cells with null age values. If False, keeps all cells regardless of age.
     """
     start_time = time.time()
     
@@ -688,7 +815,8 @@ def convert_h5ad_to_train_test(
         test_size=test_size,
         skip_train_test_split=skip_train_test_split,
         stratify_by_age=stratify_by_age,
-        join_collection=join_collection
+        join_collection=join_collection,
+        filter_by_age=filter_by_age
     ) as action:
         action.log(message_type="processing_started", h5ad_file=str(h5ad_path))
         
@@ -867,9 +995,11 @@ def convert_h5ad_to_train_test(
                 ]
                 
                 # Build chunk data with all metadata
+                # Slice rows first (more memory-efficient for backed mode), then select columns
+                chunk_obs_slice = adata.obs.iloc[start_idx:end_idx]
                 chunk_obs_data = {}
                 for col in obs_columns:
-                    series_slice = adata.obs[col].iloc[start_idx:end_idx]
+                    series_slice = chunk_obs_slice[col]
                     chunk_obs_data[col] = _to_polars_compatible(series_slice)
                 
                 # Add cell_sentence column
@@ -899,9 +1029,12 @@ def convert_h5ad_to_train_test(
                 null_ages_in_chunk = chunk_df.filter(pl.col('age').is_null()).height
                 cells_with_null_age += null_ages_in_chunk
                 
-                # Filter out null ages
-                chunk_df = chunk_df.filter(pl.col('age').is_not_null())
-                cells_filtered_out += null_ages_in_chunk
+                # Filter out null ages based on filter_by_age parameter
+                # If stratify_by_age is True, we still need to filter for stratification to work
+                if filter_by_age:
+                    chunk_df = chunk_df.filter(pl.col('age').is_not_null())
+                    cells_filtered_out += null_ages_in_chunk
+                
                 total_cells_processed += (end_idx - start_idx)
                 
                 if chunk_df.height == 0:

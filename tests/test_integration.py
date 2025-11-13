@@ -561,7 +561,6 @@ class TestBatchProcessing:
                 # Process the file
                 success, message, processing_time, dataset_output_path = _process_single_file(
                     h5ad_path=h5ad_file,
-                    interim_dir=Path("./data/interim"),  # Unused parameter (kept for API compatibility)
                     output_dir=batch_temp_dirs['output'],
                     chunk_size=10000,
                     top_genes=2000,
@@ -719,7 +718,6 @@ class TestBatchProcessing:
             
             success1, message1, time1, output_path1 = _process_single_file(
                 h5ad_path=h5ad_path,
-                interim_dir=Path("./data/interim"),  # Unused parameter (kept for API compatibility)
                 output_dir=batch_temp_dirs['output'],
                 chunk_size=10000,
                 top_genes=2000,
@@ -794,7 +792,6 @@ class TestBatchProcessing:
             # Process the file
             success, message, processing_time, output_path = _process_single_file(
                 h5ad_path=h5ad_path,
-                interim_dir=Path("./data/interim"),  # Unused parameter (kept for API compatibility)
                 output_dir=batch_temp_dirs['output'],
                 chunk_size=10000,
                 top_genes=2000,
