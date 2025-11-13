@@ -142,7 +142,8 @@ def extract_fields_from_h5ad(
         requested_fields = fields if fields is not None else obs_columns
         preloaded_fields = preload_complex_obs_fields(
             obs_group=obs_group,
-            fields=[field for field in requested_fields if field in obs_columns]
+            fields=[field for field in requested_fields if field in obs_columns],
+            total_rows=n_cells
         )
         if preloaded_fields:
             action.log(

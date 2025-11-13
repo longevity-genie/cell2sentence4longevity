@@ -108,16 +108,40 @@ def _fill_string_array(arr: np.ndarray, fill_value: str) -> np.ndarray:
     return arr
 
 
-def _normalize_preloaded_column(values: Any) -> np.ndarray | list[Any]:
+def _to_string_list(values: np.ndarray) -> list[Any]:
+    result: list[Any] = []
+    for value in values.tolist():
+        if value is None:
+            result.append(None)
+        else:
+            result.append(str(value))
+    return result
+
+
+def _normalize_preloaded_column(values: Any, total_rows: int) -> np.ndarray:
     if isinstance(values, np.ndarray):
+        if values.ndim == 0:
+            filled = np.full(total_rows, _decode_scalar(values.item()), dtype=object)
+            return filled
         return values
     if hasattr(values, "to_numpy"):
-        return values.to_numpy()
+        arr = values.to_numpy()
+        arr = np.asarray(arr, dtype=object)
+        if arr.ndim == 0:
+            arr = np.full(total_rows, _decode_scalar(arr.item()), dtype=object)
+        return arr
     if hasattr(values, "to_list"):
-        return values.to_list()
-    if hasattr(values, "tolist"):
-        return values.tolist()
-    return np.asarray(values, dtype=object)
+        arr = np.asarray(values.to_list(), dtype=object)
+    elif hasattr(values, "tolist"):
+        arr = np.asarray(values.tolist(), dtype=object)
+    else:
+        try:
+            arr = np.asarray(values, dtype=object)
+        except Exception:
+            arr = np.array([values], dtype=object)
+    if arr.ndim == 0:
+        arr = np.full(total_rows, _decode_scalar(arr.item()), dtype=object)
+    return arr
 
 
 def _slice_preloaded_column(
@@ -171,8 +195,8 @@ def read_obs_chunk_dict(
         if is_string_field:
             if string_fill_value is not None:
                 values = _fill_string_array(values, string_fill_value)
-            values_list = values.tolist()
-            values = pl.Series(field, values_list, dtype=pl.String)
+            values_list = _to_string_list(values)
+            values = pl.Series(field, values_list, dtype=pl.String, strict=False)
         if as_lists:
             if isinstance(values, np.ndarray):
                 values = values.tolist()
@@ -208,9 +232,10 @@ def build_obs_chunk_dataframe(
 
 def preload_complex_obs_fields(
     obs_group: h5py.Group,
-    fields: list[str]
-) -> dict[str, np.ndarray | list[Any]]:
-    preloaded: dict[str, np.ndarray | list[Any]] = {}
+    fields: list[str],
+    total_rows: int
+) -> dict[str, np.ndarray]:
+    preloaded: dict[str, np.ndarray] = {}
     for field in fields:
         node = obs_group.get(field)
         if node is None:
@@ -224,7 +249,7 @@ def preload_complex_obs_fields(
         except Exception as exc:
             msg = f"Failed to preload obs field '{field}': {exc}"
             raise RuntimeError(msg) from exc
-        preloaded[field] = _normalize_preloaded_column(values)
+        preloaded[field] = _normalize_preloaded_column(values, total_rows)
     return preloaded
 
 
