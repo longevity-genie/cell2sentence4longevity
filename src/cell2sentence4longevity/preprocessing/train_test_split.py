@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import os
 
+import numpy as np
 import polars as pl
 from eliot import start_action
 from tqdm import tqdm
@@ -22,7 +23,11 @@ def create_train_test_split(
     compression_level: int = 3,
     use_pyarrow: bool = True
 ) -> None:
-    """Create stratified train/test split.
+    """Create donor-level stratified train/test split to prevent data leakage.
+    
+    This function ensures that all cells from the same donor appear in either train or test,
+    but not both. This prevents the model from learning donor-specific signatures instead of
+    true age-related patterns.
     
     Args:
         parquet_dir: Directory containing parquet chunks (can be dataset_name/chunks/ or flat)
@@ -161,29 +166,126 @@ def create_train_test_split(
                 warning="Some ages have very few samples, stratification might fail"
             )
         
+        # Identify donor column (try common names)
+        donor_cols = ['donor_id', 'donor', 'subject_id', 'individual']
+        # Check columns in the lazy dataset
+        available_columns = lazy_dataset.collect_schema().names()
+        donor_col = next((col for col in donor_cols if col in available_columns), None)
+        
+        if donor_col is None:
+            action.log(
+                message_type="warning_no_donor_column",
+                warning=f"No donor column found (tried: {donor_cols}), falling back to cell-level split",
+                available_columns=available_columns
+            )
+            use_donor_split = False
+        else:
+            action.log(
+                message_type="using_donor_level_split",
+                donor_col=donor_col,
+                note="All cells from same donor will be in same split to prevent data leakage"
+            )
+            use_donor_split = True
+            
+            # Count unique donors
+            total_donors = (
+                lazy_dataset
+                .select(donor_col)
+                .unique()
+                .select(pl.len())
+                .collect()
+                .item()
+            )
+            action.log(
+                message_type="donor_statistics",
+                total_donors=total_donors,
+                total_cells=total_cells_after_filtering,
+                avg_cells_per_donor=round(total_cells_after_filtering / total_donors, 2) if total_donors > 0 else 0
+            )
+        
         # Create output directories: output_dir/dataset_name/train/ and output_dir/dataset_name/test/
         train_dir = output_dir / dataset_name / "train"
         test_dir = output_dir / dataset_name / "test"
         train_dir.mkdir(parents=True, exist_ok=True)
         test_dir.mkdir(parents=True, exist_ok=True)
         
-        # Use streaming stratified split with lazy API
-        # Add random column for stratified splitting (lazy operation)
-        # We use hash of age combined with row position to get deterministic but random assignment
-        # within each age group for proper stratification
-        action.log(message_type="creating_stratified_split_streaming")
-        lazy_with_split = (
-            lazy_dataset
-            .with_row_index("_row_idx")
-            .with_columns(
-                ((pl.col('age').hash(seed=random_state) + pl.col('_row_idx').hash(seed=random_state + 1)) % 10000 / 10000.0).alias('_random_split')
+        # Use streaming donor-level stratified split with lazy API
+        if use_donor_split:
+            # Donor-level stratified split: group by donor, compute representative age,
+            # then split donors (not cells) by age distribution
+            action.log(message_type="creating_donor_level_stratified_split")
+            
+            # Compute representative age for each donor (median age of their cells)
+            donor_ages = (
+                lazy_dataset
+                .group_by(donor_col)
+                .agg([
+                    pl.col('age').median().alias('donor_age'),
+                    pl.len().alias('cell_count')
+                ])
+            ).collect()
+            
+            action.log(
+                message_type="donor_age_distribution",
+                donor_ages_sample=donor_ages.head(10).to_dicts()
             )
-            .drop('_row_idx')
-        )
-        
-        # Create train and test lazy datasets
-        lazy_train = lazy_with_split.filter(pl.col('_random_split') >= test_size).drop('_random_split')
-        lazy_test = lazy_with_split.filter(pl.col('_random_split') < test_size).drop('_random_split')
+            
+            # Use sklearn for stratified donor split (stratify by donor age)
+            # This ensures age distribution is maintained at donor level
+            donor_ids_array = donor_ages[donor_col].to_numpy()
+            donor_ages_array = donor_ages['donor_age'].to_numpy()
+            
+            # Stratify by donor age (rounded to avoid too many unique values)
+            donor_ages_rounded = np.round(donor_ages_array, 1)
+            
+            try:
+                train_donor_ids, test_donor_ids = sklearn_split(
+                    donor_ids_array,
+                    test_size=test_size,
+                    random_state=random_state,
+                    stratify=donor_ages_rounded
+                )
+                action.log(
+                    message_type="donor_split_complete",
+                    train_donors=len(train_donor_ids),
+                    test_donors=len(test_donor_ids)
+                )
+            except ValueError as e:
+                # Stratification failed (probably too few donors per age)
+                # Fall back to random split of donors
+                action.log(
+                    message_type="donor_stratification_failed",
+                    error=str(e),
+                    fallback="Using random donor split without stratification"
+                )
+                train_donor_ids, test_donor_ids = sklearn_split(
+                    donor_ids_array,
+                    test_size=test_size,
+                    random_state=random_state,
+                    stratify=None
+                )
+            
+            # Create train and test lazy datasets based on donor assignment
+            train_donor_series = pl.Series(donor_col, train_donor_ids)
+            test_donor_series = pl.Series(donor_col, test_donor_ids)
+            
+            lazy_train = lazy_dataset.filter(pl.col(donor_col).is_in(train_donor_series))
+            lazy_test = lazy_dataset.filter(pl.col(donor_col).is_in(test_donor_series))
+        else:
+            # Cell-level stratified split (fallback when no donor column)
+            action.log(message_type="creating_stratified_split_streaming")
+            lazy_with_split = (
+                lazy_dataset
+                .with_row_index("_row_idx")
+                .with_columns(
+                    ((pl.col('age').hash(seed=random_state) + pl.col('_row_idx').hash(seed=random_state + 1)) % 10000 / 10000.0).alias('_random_split')
+                )
+                .drop('_row_idx')
+            )
+            
+            # Create train and test lazy datasets
+            lazy_train = lazy_with_split.filter(pl.col('_random_split') >= test_size).drop('_random_split')
+            lazy_test = lazy_with_split.filter(pl.col('_random_split') < test_size).drop('_random_split')
         
         # Count cells in each split (lazy)
         train_cells = lazy_train.select(pl.len()).collect().item()

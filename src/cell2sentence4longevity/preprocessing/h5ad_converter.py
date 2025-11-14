@@ -959,10 +959,16 @@ def convert_h5ad_to_train_test(
     2. Creates cell sentences
     3. Extracts age from development_stage
     4. Adds dataset_id column for joining with collection metadata (if applicable)
-    5. Assigns cells to train/test split (stratified by age using pure Polars)
+    5. Assigns cells to train/test split using DONOR-LEVEL stratification by age
     6. Writes directly to train/test output directories
     
     No interim files, no pandas/sklearn conversion - pure Polars for memory efficiency.
+    
+    IMPORTANT: Donor-level splitting
+    - All cells from the same donor are assigned to either train OR test, never both
+    - This prevents data leakage of subject-specific signatures
+    - Donors are stratified by their median age to maintain age distribution
+    - Falls back to cell-level split if no donor column is found (donor_id, donor, subject_id, individual)
     
     Collection joining behavior:
     - By default (join_collection=True), auto-detects if dataset is from CellxGene (by UUID pattern or URL)
@@ -992,7 +998,7 @@ def convert_h5ad_to_train_test(
         compression_level: Compression level
         use_pyarrow: Use pyarrow backend for parquet writes
         skip_train_test_split: If True, writes all data to output_dir without splitting
-        stratify_by_age: If True, maintains age distribution in train/test splits (default: True)
+        stratify_by_age: If True, maintains age distribution in train/test splits at DONOR level (default: True)
         join_collection: If True (default), auto-detects cellxgene datasets and always adds dataset_id column. Only joins with collections metadata if dataset is found in collections cache. If False, skips collection joining and does not add dataset_id column.
         filter_by_age: If True (default), filters out cells with null age values. If False, keeps all cells regardless of age.
         gene_lists_dir: Optional directory containing .txt files with gene lists (one gene per row). If provided, creates full_gene_sentence and filtered cell_sentence columns.
@@ -1337,38 +1343,109 @@ def convert_h5ad_to_train_test(
                                    output_file=str(output_file),
                                    rows=len(chunk_df))
                 else:
-                    # Stratified or random split using pure Polars
-                    if stratify_by_age:
-                        # Stratified split: maintain age distribution across train/test
-                        # Add random number for stratified sampling within each age group
-                        chunk_df = chunk_df.with_columns(
-                            pl.lit(rng.random(chunk_df.height)).alias('_random_split')
+                    # Donor-level split to prevent leakage of subject-specific signatures
+                    # First, identify donor column (try common names)
+                    donor_cols = ['donor_id', 'donor', 'subject_id', 'individual']
+                    donor_col = next((col for col in donor_cols if col in chunk_df.columns), None)
+                    
+                    if donor_col is None:
+                        # No donor column found - fall back to cell-level split
+                        chunk_action.log(
+                            message_type="warning_no_donor_column",
+                            warning=f"No donor column found (tried: {donor_cols}), falling back to cell-level split",
+                            available_columns=chunk_df.columns
                         )
-                        
-                        # For each age group, split proportionally
-                        # Group by age, then filter by random number threshold
-                        train_chunk = (
-                            chunk_df
-                            .group_by('age', maintain_order=True)
-                            .agg(pl.all())
-                            .explode(pl.all().exclude('age'))
-                            .filter(pl.col('_random_split') >= test_size)
-                            .drop('_random_split')
-                        )
-                        
-                        test_chunk = (
-                            chunk_df
-                            .group_by('age', maintain_order=True)
-                            .agg(pl.all())
-                            .explode(pl.all().exclude('age'))
-                            .filter(pl.col('_random_split') < test_size)
-                            .drop('_random_split')
-                        )
+                        if stratify_by_age:
+                            # Stratified split: maintain age distribution across train/test
+                            # Add random number for stratified sampling within each age group
+                            chunk_df = chunk_df.with_columns(
+                                pl.lit(rng.random(chunk_df.height)).alias('_random_split')
+                            )
+                            
+                            # For each age group, split proportionally
+                            # Group by age, then filter by random number threshold
+                            train_chunk = (
+                                chunk_df
+                                .group_by('age', maintain_order=True)
+                                .agg(pl.all())
+                                .explode(pl.all().exclude('age'))
+                                .filter(pl.col('_random_split') >= test_size)
+                                .drop('_random_split')
+                            )
+                            
+                            test_chunk = (
+                                chunk_df
+                                .group_by('age', maintain_order=True)
+                                .agg(pl.all())
+                                .explode(pl.all().exclude('age'))
+                                .filter(pl.col('_random_split') < test_size)
+                                .drop('_random_split')
+                            )
+                        else:
+                            # Simple random split (faster, no stratification)
+                            split_assignments = rng.random(chunk_df.height) >= test_size
+                            train_chunk = chunk_df.filter(pl.Series(split_assignments))
+                            test_chunk = chunk_df.filter(~pl.Series(split_assignments))
                     else:
-                        # Simple random split (faster, no stratification)
-                        split_assignments = rng.random(chunk_df.height) >= test_size
-                        train_chunk = chunk_df.filter(pl.Series(split_assignments))
-                        test_chunk = chunk_df.filter(~pl.Series(split_assignments))
+                        # Donor-level split: ensure all cells from same donor go to same split
+                        chunk_action.log(
+                            message_type="using_donor_level_split",
+                            donor_col=donor_col,
+                            unique_donors_in_chunk=chunk_df[donor_col].n_unique()
+                        )
+                        
+                        if stratify_by_age:
+                            # Donor-level stratified split: group by donor, compute representative age,
+                            # then split donors (not cells) by age distribution
+                            
+                            # Compute representative age for each donor (median age of their cells)
+                            donor_ages = (
+                                chunk_df
+                                .group_by(donor_col)
+                                .agg([
+                                    pl.col('age').median().alias('donor_age')
+                                ])
+                            )
+                            
+                            # Assign each donor to train or test based on stratified sampling by donor_age
+                            # Add random number for each donor
+                            donor_ages = donor_ages.with_columns(
+                                pl.lit(rng.random(donor_ages.height)).alias('_random_split')
+                            )
+                            
+                            # Stratify donors by their representative age
+                            # For each age bin, split donors proportionally
+                            train_donors = (
+                                donor_ages
+                                .group_by('donor_age', maintain_order=True)
+                                .agg(pl.all())
+                                .explode(pl.all().exclude('donor_age'))
+                                .filter(pl.col('_random_split') >= test_size)
+                                .select(donor_col)
+                            )
+                            
+                            test_donors = (
+                                donor_ages
+                                .group_by('donor_age', maintain_order=True)
+                                .agg(pl.all())
+                                .explode(pl.all().exclude('donor_age'))
+                                .filter(pl.col('_random_split') < test_size)
+                                .select(donor_col)
+                            )
+                            
+                            # Join back to get all cells for each donor
+                            train_chunk = chunk_df.join(train_donors, on=donor_col, how='inner')
+                            test_chunk = chunk_df.join(test_donors, on=donor_col, how='inner')
+                        else:
+                            # Simple donor-level random split
+                            unique_donors = chunk_df.select(donor_col).unique()
+                            split_assignments = rng.random(unique_donors.height) >= test_size
+                            train_donors = unique_donors.filter(pl.Series(split_assignments))
+                            test_donors = unique_donors.filter(~pl.Series(split_assignments))
+                            
+                            # Join back to get all cells for each donor
+                            train_chunk = chunk_df.join(train_donors, on=donor_col, how='inner')
+                            test_chunk = chunk_df.join(test_donors, on=donor_col, how='inner')
                     
                     train_cells += train_chunk.height
                     test_cells += test_chunk.height

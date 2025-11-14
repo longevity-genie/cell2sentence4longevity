@@ -29,6 +29,282 @@ MAX_SAMPLE_ROWS = 5
 MAX_NESTED_ITEMS = 8
 
 
+def _build_summary_expressions(
+    schema: pl.Schema,
+    total_cells: int
+) -> tuple[list[pl.Expr], dict[str, str]]:
+    """Build Polars aggregation expressions for creating a summary.
+    
+    Returns:
+        tuple: (list of expressions, dict mapping column names to their source columns for logging)
+    """
+    exprs: list[pl.Expr] = []
+    column_sources: dict[str, str] = {}
+    
+    # Total cells
+    exprs.append(pl.lit(total_cells).alias('total_cells'))
+    
+    # Dataset ID (first non-null)
+    if 'dataset_id' in schema:
+        exprs.append(pl.col('dataset_id').filter(pl.col('dataset_id').is_not_null()).first().alias('dataset_id'))
+    else:
+        exprs.append(pl.lit(None, dtype=pl.String).alias('dataset_id'))
+    
+    # Organism (first non-null)
+    if 'organism' in schema:
+        exprs.append(pl.col('organism').filter(pl.col('organism').is_not_null()).first().alias('organism'))
+    else:
+        exprs.append(pl.lit('Homo sapiens').alias('organism'))
+    
+    # Unique donors
+    donor_cols = ['donor_id', 'donor', 'subject_id', 'individual']
+    donor_col = next((col for col in donor_cols if col in schema), None)
+    if donor_col:
+        exprs.append(pl.col(donor_col).n_unique().alias('unique_donors'))
+        column_sources['unique_donors'] = donor_col
+    else:
+        exprs.append(pl.lit(None, dtype=pl.Int64).alias('unique_donors'))
+    
+    # Collection info (first non-null values)
+    if 'collection_id' in schema:
+        exprs.append(pl.col('collection_id').filter(pl.col('collection_id').is_not_null()).first().alias('collection_id'))
+    else:
+        exprs.append(pl.lit(None, dtype=pl.String).alias('collection_id'))
+    
+    if 'publication_title' in schema:
+        exprs.append(pl.col('publication_title').filter(pl.col('publication_title').is_not_null()).first().alias('publication_title'))
+    else:
+        exprs.append(pl.lit(None, dtype=pl.String).alias('publication_title'))
+    
+    if 'publication_doi' in schema:
+        exprs.append(pl.col('publication_doi').filter(pl.col('publication_doi').is_not_null()).first().alias('publication_doi'))
+    else:
+        exprs.append(pl.lit(None, dtype=pl.String).alias('publication_doi'))
+    
+    # Age statistics
+    if 'age_years' in schema:
+        exprs.extend([
+            pl.col('age_years').min().alias('age_years_min'),
+            pl.col('age_years').max().alias('age_years_max'),
+            pl.col('age_years').mean().alias('age_years_mean'),
+            pl.col('age_years').is_not_null().sum().alias('cells_with_age_years')
+        ])
+    else:
+        exprs.extend([
+            pl.lit(None, dtype=pl.Float64).alias('age_years_min'),
+            pl.lit(None, dtype=pl.Float64).alias('age_years_max'),
+            pl.lit(None, dtype=pl.Float64).alias('age_years_mean'),
+            pl.lit(0).alias('cells_with_age_years')
+        ])
+    
+    if 'age_months' in schema:
+        exprs.extend([
+            pl.col('age_months').min().alias('age_months_min'),
+            pl.col('age_months').max().alias('age_months_max'),
+            pl.col('age_months').mean().alias('age_months_mean'),
+            pl.col('age_months').is_not_null().sum().alias('cells_with_age_months')
+        ])
+    else:
+        exprs.extend([
+            pl.lit(None, dtype=pl.Float64).alias('age_months_min'),
+            pl.lit(None, dtype=pl.Float64).alias('age_months_max'),
+            pl.lit(None, dtype=pl.Float64).alias('age_months_mean'),
+            pl.lit(0).alias('cells_with_age_months')
+        ])
+    
+    return exprs, column_sources
+
+
+def _add_categorical_summaries(
+    summary_df: pl.DataFrame,
+    meta_lazy: pl.LazyFrame,
+    schema: pl.Schema
+) -> pl.DataFrame:
+    """Add categorical summary columns (tissues, cell types, etc.) to summary DataFrame.
+    
+    This handles the grouped aggregations that can't be done in a single expression.
+    """
+    # Tissues with counts
+    tissue_cols = ['tissue', 'tissue_type', 'organ', 'tissue_general']
+    tissue_col = next((col for col in tissue_cols if col in schema), None)
+    if tissue_col:
+        tissue_counts = (
+            meta_lazy
+            .group_by(tissue_col)
+            .agg(pl.len().alias('count'))
+            .sort('count', descending=True)
+            .collect(streaming=True)
+        )
+        unique_tissues = tissue_counts.height
+        tissue_list = [
+            f"{row[tissue_col]}: {row['count']}"
+            for row in tissue_counts.iter_rows(named=True)
+            if row[tissue_col] is not None
+        ]
+        summary_df = summary_df.with_columns([
+            pl.lit(unique_tissues).alias('unique_tissues'),
+            pl.lit(", ".join(tissue_list) if tissue_list else None).alias('tissues')
+        ])
+    else:
+        summary_df = summary_df.with_columns([
+            pl.lit(None, dtype=pl.Int64).alias('unique_tissues'),
+            pl.lit(None, dtype=pl.String).alias('tissues')
+        ])
+    
+    # Cell types with counts
+    cell_type_cols = ['cell_type', 'cell_type_ontology_term_id', 'celltype']
+    cell_type_col = next((col for col in cell_type_cols if col in schema), None)
+    if cell_type_col:
+        cell_type_counts = (
+            meta_lazy
+            .group_by(cell_type_col)
+            .agg(pl.len().alias('count'))
+            .sort('count', descending=True)
+            .collect(streaming=True)
+        )
+        unique_cell_types = cell_type_counts.height
+        cell_type_list = [
+            f"{row[cell_type_col]}: {row['count']}"
+            for row in cell_type_counts.iter_rows(named=True)
+            if row[cell_type_col] is not None
+        ]
+        summary_df = summary_df.with_columns([
+            pl.lit(unique_cell_types).alias('unique_cell_types'),
+            pl.lit(", ".join(cell_type_list) if cell_type_list else None).alias('cell_types')
+        ])
+    else:
+        summary_df = summary_df.with_columns([
+            pl.lit(None, dtype=pl.Int64).alias('unique_cell_types'),
+            pl.lit(None, dtype=pl.String).alias('cell_types')
+        ])
+    
+    # Assays with counts
+    assay_cols = ['assay', 'assay_ontology_term_id', 'technology', 'platform']
+    assay_col = next((col for col in assay_cols if col in schema), None)
+    if assay_col:
+        assay_counts = (
+            meta_lazy
+            .group_by(assay_col)
+            .agg(pl.len().alias('count'))
+            .sort('count', descending=True)
+            .collect(streaming=True)
+        )
+        unique_assays = assay_counts.height
+        assay_list = [
+            f"{row[assay_col]}: {row['count']}"
+            for row in assay_counts.iter_rows(named=True)
+            if row[assay_col] is not None
+        ]
+        summary_df = summary_df.with_columns([
+            pl.lit(unique_assays).alias('unique_assays'),
+            pl.lit(", ".join(assay_list) if assay_list else None).alias('assays')
+        ])
+    else:
+        summary_df = summary_df.with_columns([
+            pl.lit(None, dtype=pl.Int64).alias('unique_assays'),
+            pl.lit(None, dtype=pl.String).alias('assays')
+        ])
+    
+    # Sex with counts
+    sex_cols = ['sex', 'sex_ontology_term_id', 'gender']
+    sex_col = next((col for col in sex_cols if col in schema), None)
+    if sex_col:
+        sex_counts = (
+            meta_lazy
+            .group_by(sex_col)
+            .agg(pl.len().alias('count'))
+            .sort('count', descending=True)
+            .collect(streaming=True)
+        )
+        unique_sexes = sex_counts.height
+        sex_list = [
+            f"{row[sex_col]}: {row['count']}"
+            for row in sex_counts.iter_rows(named=True)
+            if row[sex_col] is not None
+        ]
+        summary_df = summary_df.with_columns([
+            pl.lit(unique_sexes).alias('unique_sexes'),
+            pl.lit(", ".join(sex_list) if sex_list else None).alias('sexes')
+        ])
+    else:
+        summary_df = summary_df.with_columns([
+            pl.lit(None, dtype=pl.Int64).alias('unique_sexes'),
+            pl.lit(None, dtype=pl.String).alias('sexes')
+        ])
+    
+    # Diseases with counts
+    disease_cols = ['disease', 'disease_ontology_term_id', 'condition']
+    disease_col = next((col for col in disease_cols if col in schema), None)
+    if disease_col:
+        disease_counts = (
+            meta_lazy
+            .group_by(disease_col)
+            .agg(pl.len().alias('count'))
+            .sort('count', descending=True)
+            .collect(streaming=True)
+        )
+        unique_diseases = disease_counts.height
+        disease_list = [
+            f"{row[disease_col]}: {row['count']}"
+            for row in disease_counts.iter_rows(named=True)
+            if row[disease_col] is not None
+        ]
+        summary_df = summary_df.with_columns([
+            pl.lit(unique_diseases).alias('unique_diseases'),
+            pl.lit(", ".join(disease_list) if disease_list else None).alias('diseases')
+        ])
+    else:
+        summary_df = summary_df.with_columns([
+            pl.lit(None, dtype=pl.Int64).alias('unique_diseases'),
+            pl.lit(None, dtype=pl.String).alias('diseases')
+        ])
+    
+    # Add unique ages as comma-separated strings with counts
+    if 'age_years' in schema:
+        age_years_counts = (
+            meta_lazy
+            .filter(pl.col('age_years').is_not_null())
+            .group_by('age_years')
+            .agg(pl.len().alias('count'))
+            .sort('age_years')
+            .collect(streaming=True)
+        )
+        age_years_list = [
+            f"{row['age_years']}: {row['count']}"
+            for row in age_years_counts.iter_rows(named=True)
+        ]
+        summary_df = summary_df.with_columns(
+            pl.lit(", ".join(age_years_list) if age_years_list else None).alias('unique_ages_years')
+        )
+    else:
+        summary_df = summary_df.with_columns(
+            pl.lit(None, dtype=pl.String).alias('unique_ages_years')
+        )
+    
+    if 'age_months' in schema:
+        age_months_counts = (
+            meta_lazy
+            .filter(pl.col('age_months').is_not_null())
+            .group_by('age_months')
+            .agg(pl.len().alias('count'))
+            .sort('age_months')
+            .collect(streaming=True)
+        )
+        age_months_list = [
+            f"{row['age_months']}: {row['count']}"
+            for row in age_months_counts.iter_rows(named=True)
+        ]
+        summary_df = summary_df.with_columns(
+            pl.lit(", ".join(age_months_list) if age_months_list else None).alias('unique_ages_months')
+        )
+    else:
+        summary_df = summary_df.with_columns(
+            pl.lit(None, dtype=pl.String).alias('unique_ages_months')
+        )
+    
+    return summary_df
+
+
 def _coerce_all_null_object_columns(
     df: pl.DataFrame,
     obs_schema: dict[str, pl.DataType]
@@ -110,7 +386,8 @@ def extract_fields_from_h5ad(
     use_pyarrow: bool = True,
     extract_age: bool = True,
     age_source_col: str = "development_stage",
-    generate_summary: bool = False
+    generate_summary: bool = False,
+    verbose_logging: bool = True
 ) -> None:
     """Extract specified metadata fields from h5ad file in a memory-efficient way.
     
@@ -125,6 +402,7 @@ def extract_fields_from_h5ad(
         extract_age: Whether to extract age from development_stage column
         age_source_col: Column to extract age from (default: development_stage)
         generate_summary: Whether to generate a summary with unique values and counts
+        verbose_logging: Whether to log detailed chunk processing info (disable for batch processing)
     """
     with start_action(
         action_type="extract_fields_from_h5ad",
@@ -145,25 +423,26 @@ def extract_fields_from_h5ad(
             fields=[field for field in requested_fields if field in obs_columns],
             total_rows=n_cells
         )
-        if preloaded_fields:
+        if preloaded_fields and verbose_logging:
             action.log(
                 message_type="preloaded_complex_obs_fields",
                 fields=list(preloaded_fields.keys())
             )
         
-        action.log(
-            message_type="h5ad_loaded",
-            n_cells=n_cells,
-            n_genes=adata.n_vars,
-            available_fields=obs_columns
-        )
+        if verbose_logging:
+            action.log(
+                message_type="h5ad_loaded",
+                n_cells=n_cells,
+                n_genes=adata.n_vars,
+                available_fields=obs_columns
+            )
         
         # Check which fields are available
         available_fields = set(obs_columns)
         missing_fields = [f for f in requested_fields if f not in available_fields]
         valid_fields = [f for f in requested_fields if f in available_fields]
         
-        if missing_fields:
+        if missing_fields and verbose_logging:
             action.log(
                 message_type="missing_fields_warning",
                 missing_fields=missing_fields,
@@ -179,11 +458,12 @@ def extract_fields_from_h5ad(
         
         # Process in chunks for memory efficiency
         n_chunks = (n_cells + chunk_size - 1) // chunk_size
-        action.log(
-            message_type="starting_chunk_processing",
-            total_chunks=n_chunks,
-            chunk_size=chunk_size
-        )
+        if verbose_logging:
+            action.log(
+                message_type="starting_chunk_processing",
+                total_chunks=n_chunks,
+                chunk_size=chunk_size
+            )
         
         # Create temp directory for chunks
         temp_dir = output_path.parent / f".temp_{output_path.stem}"
@@ -191,8 +471,18 @@ def extract_fields_from_h5ad(
         
         categorical_cache: dict[str, Any] = {}
         
-        for chunk_idx in tqdm(range(n_chunks), desc='Extracting metadata'):
-            with start_action(action_type="process_chunk", chunk_idx=chunk_idx) as chunk_action:
+        # Only show progress bar if verbose logging is enabled
+        chunk_range = tqdm(range(n_chunks), desc='Extracting metadata', disable=not verbose_logging)
+        for chunk_idx in chunk_range:
+            # Only create chunk action if verbose logging is enabled
+            if verbose_logging:
+                chunk_context = start_action(action_type="process_chunk", chunk_idx=chunk_idx)
+            else:
+                # Use a dummy context manager that does nothing
+                from contextlib import nullcontext
+                chunk_context = nullcontext()
+            
+            with chunk_context as chunk_action:
                 start_idx = chunk_idx * chunk_size
                 end_idx = min(start_idx + chunk_size, n_cells)
                 
@@ -253,12 +543,13 @@ def extract_fields_from_h5ad(
                         use_pyarrow=use_pyarrow
                     )
                     
-                    chunk_action.log(
-                        message_type="chunk_processed",
-                        rows=end_idx - start_idx,
-                        start_idx=start_idx,
-                        end_idx=end_idx
-                    )
+                    if verbose_logging and chunk_action is not None:
+                        chunk_action.log(
+                            message_type="chunk_processed",
+                            rows=end_idx - start_idx,
+                            start_idx=start_idx,
+                            end_idx=end_idx
+                        )
                     
                     chunk_df = None
                 except Exception as exc:
@@ -272,21 +563,23 @@ def extract_fields_from_h5ad(
                                     "_error": f"Failed to serialize sample rows: {sample_exc}"
                                 }
                             ]
-                    chunk_action.log(
-                        message_type="chunk_failure_sample",
-                        error=str(exc),
-                        start_idx=start_idx,
-                        end_idx=end_idx,
-                        columns=chunk_columns,
-                        sample_rows=sample_rows
-                    )
+                    if verbose_logging and chunk_action is not None:
+                        chunk_action.log(
+                            message_type="chunk_failure_sample",
+                            error=str(exc),
+                            start_idx=start_idx,
+                            end_idx=end_idx,
+                            columns=chunk_columns,
+                            sample_rows=sample_rows
+                        )
                     raise
                 finally:
                     if chunk_df is not None:
                         del chunk_df
         
         # Read all chunks lazily without materializing full dataset
-        action.log(message_type="building_lazy_dataframe", n_chunks=n_chunks)
+        if verbose_logging:
+            action.log(message_type="building_lazy_dataframe", n_chunks=n_chunks)
         try:
             final_lazy_df = pl.scan_parquet(temp_dir / "*.parquet")
             schema_names = set(final_lazy_df.collect_schema().names())
@@ -347,38 +640,43 @@ def extract_fields_from_h5ad(
                 if 'dataset_id' not in schema_names:
                     final_lazy_df = final_lazy_df.with_columns(pl.lit(dataset_id).alias('dataset_id'))
                     schema_names = set(final_lazy_df.collect_schema().names())
-                    action.log(
-                        message_type="dataset_id_added",
-                        dataset_id=dataset_id
-                    )
+                    if verbose_logging:
+                        action.log(
+                            message_type="dataset_id_added",
+                            dataset_id=dataset_id
+                        )
                 
                 # Always attempt to join with collections (left join will add null values if not found)
                 # This ensures consistent schema across all summaries
-                action.log(
-                    message_type="joining_with_collections",
-                    dataset_id=dataset_id
-                )
+                if verbose_logging:
+                    action.log(
+                        message_type="joining_with_collections",
+                        dataset_id=dataset_id
+                    )
                 final_lazy_df = join_with_collections(final_lazy_df)
                 schema_names = set(final_lazy_df.collect_schema().names())
                 
                 # Check if dataset was actually found in collections
                 if dataset_id_exists_in_collections(dataset_id):
-                    action.log(
-                        message_type="collection_found",
-                        dataset_id=dataset_id,
-                        note="Dataset found in collections, metadata added"
-                    )
+                    if verbose_logging:
+                        action.log(
+                            message_type="collection_found",
+                            dataset_id=dataset_id,
+                            note="Dataset found in collections, metadata added"
+                        )
                 else:
-                    action.log(
-                        message_type="dataset_not_in_collections",
-                        dataset_id=dataset_id,
-                        note="Dataset not found in collections cache, collection columns will be null"
-                    )
+                    if verbose_logging:
+                        action.log(
+                            message_type="dataset_not_in_collections",
+                            dataset_id=dataset_id,
+                            note="Dataset not found in collections cache, collection columns will be null"
+                        )
             else:
-                action.log(
-                    message_type="not_cellxgene_dataset",
-                    note="Dataset does not match CellxGene UUID pattern, skipping collection join"
-                )
+                if verbose_logging:
+                    action.log(
+                        message_type="not_cellxgene_dataset",
+                        note="Dataset does not match CellxGene UUID pattern, skipping collection join"
+                    )
         
         final_columns = list(schema_names)
         
@@ -402,7 +700,8 @@ def extract_fields_from_h5ad(
         # Clean up temp directory
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
-            action.log(message_type="temp_dir_cleaned", temp_dir=str(temp_dir))
+            if verbose_logging:
+                action.log(message_type="temp_dir_cleaned", temp_dir=str(temp_dir))
         
         written_lazy_df = pl.scan_parquet(output_path)
         written_schema = written_lazy_df.collect_schema()
@@ -438,244 +737,29 @@ def extract_fields_from_h5ad(
             summary_lazy = written_lazy_df
             summary_schema = summary_lazy.collect_schema()
             
-            def _first_non_null(column: str) -> Any | None:
-                if column not in summary_schema:
-                    return None
-                column_type = summary_schema[column]
-                if column_type == pl.Null:
-                    return None
-                result = (
-                    summary_lazy
-                    .select(pl.col(column))
-                    .filter(pl.col(column).is_not_null())
-                    .limit(1)
-                    .collect(streaming=True)
-                )
-                if result.height == 0:
-                    return None
-                return result[column][0]
-            
             with start_action(action_type="generate_summary", summary_path=str(summary_path)) as summary_action:
-                summary_data: dict[str, Any] = {}
+                # Build aggregation expressions for simple stats
+                exprs, column_sources = _build_summary_expressions(summary_schema, n_cells)
                 
-                dataset_id_value = _first_non_null('dataset_id')
-                summary_data["dataset_id"] = dataset_id_value
-                if dataset_id_value is not None:
-                    summary_action.log(message_type="dataset_id_in_summary", dataset_id=dataset_id_value)
+                # Create base summary with simple aggregations
+                summary_df = summary_lazy.select(exprs).collect(streaming=True)
                 
-                summary_data["total_cells"] = n_cells
+                # Add categorical summaries (tissues, cell types, etc.)
+                summary_df = _add_categorical_summaries(summary_df, summary_lazy, summary_schema)
                 
-                organism_value = _first_non_null('organism')
-                if organism_value is not None:
-                    summary_data["organism"] = organism_value
+                # Log statistics
+                if 'dataset_id' in summary_df.columns:
+                    dataset_id_val = summary_df['dataset_id'][0]
+                    if dataset_id_val is not None:
+                        summary_action.log(message_type="dataset_id_in_summary", dataset_id=dataset_id_val)
                 
-                # Count unique donors (look for common donor column names)
-                donor_cols = ['donor_id', 'donor', 'subject_id', 'individual']
-                donor_col = next((col for col in donor_cols if col in summary_schema), None)
-                if donor_col:
-                    unique_donors_df = summary_lazy.select(
-                        pl.col(donor_col).n_unique().alias('unique_donors')
-                    ).collect(streaming=True)
-                    unique_donors = int(unique_donors_df['unique_donors'][0])
-                    summary_data["unique_donors"] = unique_donors
-                    summary_action.log(message_type="donor_count", column=donor_col, count=unique_donors)
+                for col_name, source_col in column_sources.items():
+                    if col_name in summary_df.columns:
+                        val = summary_df[col_name][0]
+                        if val is not None:
+                            summary_action.log(message_type=f"{col_name}_info", column=source_col, value=val)
                 
-                # Unique tissues with counts
-                tissue_cols = ['tissue', 'tissue_type', 'organ', 'tissue_general']
-                tissue_col = next((col for col in tissue_cols if col in summary_schema), None)
-                if tissue_col:
-                    tissue_counts = (
-                        summary_lazy
-                        .group_by(tissue_col)
-                        .agg(pl.len().alias('count'))
-                        .sort('count', descending=True)
-                        .collect(streaming=True)
-                    )
-                    unique_tissues = tissue_counts.height
-                    summary_data["unique_tissues"] = unique_tissues
-                    tissue_list = [
-                        f"{row[tissue_col]}: {row['count']}"
-                        for row in tissue_counts.iter_rows(named=True)
-                        if row[tissue_col] is not None
-                    ]
-                    summary_data["tissues"] = ", ".join(tissue_list)
-                    summary_action.log(message_type="tissue_info", column=tissue_col, count=unique_tissues)
-                
-                # Unique cell types with counts
-                cell_type_cols = ['cell_type', 'cell_type_ontology_term_id', 'celltype']
-                cell_type_col = next((col for col in cell_type_cols if col in summary_schema), None)
-                if cell_type_col:
-                    cell_type_counts = (
-                        summary_lazy
-                        .group_by(cell_type_col)
-                        .agg(pl.len().alias('count'))
-                        .sort('count', descending=True)
-                        .collect(streaming=True)
-                    )
-                    unique_cell_types = cell_type_counts.height
-                    summary_data["unique_cell_types"] = unique_cell_types
-                    cell_type_list = [
-                        f"{row[cell_type_col]}: {row['count']}"
-                        for row in cell_type_counts.iter_rows(named=True)
-                        if row[cell_type_col] is not None
-                    ]
-                    summary_data["cell_types"] = ", ".join(cell_type_list)
-                    summary_action.log(message_type="cell_type_info", column=cell_type_col, count=unique_cell_types)
-                
-                # Assay/Technology information
-                assay_cols = ['assay', 'assay_ontology_term_id', 'technology', 'platform']
-                assay_col = next((col for col in assay_cols if col in summary_schema), None)
-                if assay_col:
-                    assay_counts = (
-                        summary_lazy
-                        .group_by(assay_col)
-                        .agg(pl.len().alias('count'))
-                        .sort('count', descending=True)
-                        .collect(streaming=True)
-                    )
-                    unique_assays = assay_counts.height
-                    summary_data["unique_assays"] = unique_assays
-                    assay_list = [
-                        f"{row[assay_col]}: {row['count']}"
-                        for row in assay_counts.iter_rows(named=True)
-                        if row[assay_col] is not None
-                    ]
-                    summary_data["assays"] = ", ".join(assay_list)
-                    summary_action.log(message_type="assay_info", column=assay_col, count=unique_assays)
-                
-                # Sex information
-                sex_cols = ['sex', 'sex_ontology_term_id', 'gender']
-                sex_col = next((col for col in sex_cols if col in summary_schema), None)
-                if sex_col:
-                    sex_counts = (
-                        summary_lazy
-                        .group_by(sex_col)
-                        .agg(pl.len().alias('count'))
-                        .sort('count', descending=True)
-                        .collect(streaming=True)
-                    )
-                    unique_sexes = sex_counts.height
-                    summary_data["unique_sexes"] = unique_sexes
-                    sex_list = [
-                        f"{row[sex_col]}: {row['count']}"
-                        for row in sex_counts.iter_rows(named=True)
-                        if row[sex_col] is not None
-                    ]
-                    summary_data["sexes"] = ", ".join(sex_list)
-                    summary_action.log(message_type="sex_info", column=sex_col, count=unique_sexes)
-                
-                # Disease information
-                disease_cols = ['disease', 'disease_ontology_term_id', 'condition']
-                disease_col = next((col for col in disease_cols if col in summary_schema), None)
-                if disease_col:
-                    disease_counts = (
-                        summary_lazy
-                        .group_by(disease_col)
-                        .agg(pl.len().alias('count'))
-                        .sort('count', descending=True)
-                        .collect(streaming=True)
-                    )
-                    unique_diseases = disease_counts.height
-                    summary_data["unique_diseases"] = unique_diseases
-                    disease_list = [
-                        f"{row[disease_col]}: {row['count']}"
-                        for row in disease_counts.iter_rows(named=True)
-                        if row[disease_col] is not None
-                    ]
-                    summary_data["diseases"] = ", ".join(disease_list)
-                    summary_action.log(message_type="disease_info", column=disease_col, count=unique_diseases)
-                
-                # Age statistics (if age columns were extracted)
-                if 'age_years' in summary_schema:
-                    age_years_non_null = summary_lazy.filter(pl.col('age_years').is_not_null())
-                    age_years_stats = (
-                        age_years_non_null
-                        .select([
-                            pl.col('age_years').min().alias('min_age'),
-                            pl.col('age_years').max().alias('max_age'),
-                            pl.col('age_years').mean().alias('mean_age'),
-                            pl.len().alias('count')
-                        ])
-                        .collect(streaming=True)
-                    )
-                    count_years = int(age_years_stats['count'][0])
-                    if count_years > 0:
-                        min_age = age_years_stats['min_age'][0]
-                        max_age = age_years_stats['max_age'][0]
-                        mean_age = round(age_years_stats['mean_age'][0], 2)
-                        unique_ages_df = (
-                            age_years_non_null
-                            .select(pl.col('age_years'))
-                            .unique()
-                            .sort('age_years')
-                            .collect(streaming=True)
-                        )
-                        unique_ages = [val for val in unique_ages_df['age_years'].to_list() if val is not None]
-                        summary_data["age_years_min"] = min_age
-                        summary_data["age_years_max"] = max_age
-                        summary_data["age_years_mean"] = mean_age
-                        summary_data["unique_ages_years"] = ", ".join(str(age) for age in unique_ages)
-                        summary_data["cells_with_age_years"] = count_years
-                        summary_action.log(
-                            message_type="age_years_stats",
-                            min=min_age,
-                            max=max_age,
-                            mean=mean_age,
-                            unique_ages=len(unique_ages),
-                            count=count_years
-                        )
-                
-                if 'age_months' in summary_schema:
-                    age_months_non_null = summary_lazy.filter(pl.col('age_months').is_not_null())
-                    age_months_stats = (
-                        age_months_non_null
-                        .select([
-                            pl.col('age_months').min().alias('min_age'),
-                            pl.col('age_months').max().alias('max_age'),
-                            pl.col('age_months').mean().alias('mean_age'),
-                            pl.len().alias('count')
-                        ])
-                        .collect(streaming=True)
-                    )
-                    count_months = int(age_months_stats['count'][0])
-                    if count_months > 0:
-                        min_age_m = age_months_stats['min_age'][0]
-                        max_age_m = age_months_stats['max_age'][0]
-                        mean_age_m = round(age_months_stats['mean_age'][0], 2)
-                        unique_ages_m_df = (
-                            age_months_non_null
-                            .select(pl.col('age_months'))
-                            .unique()
-                            .sort('age_months')
-                            .collect(streaming=True)
-                        )
-                        unique_ages_m = [val for val in unique_ages_m_df['age_months'].to_list() if val is not None]
-                        summary_data["age_months_min"] = min_age_m
-                        summary_data["age_months_max"] = max_age_m
-                        summary_data["age_months_mean"] = mean_age_m
-                        summary_data["unique_ages_months"] = ", ".join(str(age) for age in unique_ages_m)
-                        summary_data["cells_with_age_months"] = count_months
-                        summary_action.log(
-                            message_type="age_months_stats",
-                            min=min_age_m,
-                            max=max_age_m,
-                            mean=mean_age_m,
-                            unique_ages=len(unique_ages_m),
-                            count=count_months
-                        )
-                
-                # Collection info at the end (if available)
-                collection_id_value = _first_non_null('collection_id')
-                summary_data["collection_id"] = collection_id_value
-                
-                publication_title = _first_non_null('publication_title')
-                summary_data["publication_title"] = publication_title
-                
-                publication_doi = _first_non_null('publication_doi')
-                summary_data["publication_doi"] = publication_doi
-                
-                # Create and save summary dataframe (single row with columns)
-                summary_df = pl.DataFrame([summary_data])
+                # Write summary
                 summary_df.write_csv(summary_path)
                 
                 summary_action.log(
@@ -687,7 +771,8 @@ def extract_fields_from_h5ad(
         # Close the h5ad file and clean up
         adata.file.close()
         del adata, final_lazy_df, written_lazy_df
-        action.log(message_type="h5ad_file_closed")
+        if verbose_logging:
+            action.log(message_type="h5ad_file_closed")
 
 
 @app.command()
@@ -724,6 +809,7 @@ def extract(
         json_log = log_dir / "extract.json"
         rendered_log = log_dir / "extract.log"
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
+        to_nice_stdout(output_file=json_log)
     else:
         # Default to ./logs directory
         default_log_dir = Path("./logs")
@@ -731,6 +817,7 @@ def extract(
         json_log = default_log_dir / "extract.json"
         rendered_log = default_log_dir / "extract.log"
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
+        to_nice_stdout(output_file=json_log)
     
     # Determine output path
     if output_path is None:
@@ -771,7 +858,7 @@ def extract(
 
 @app.command()
 def batch(
-    input_dir: Path = typer.Argument(..., help="Directory containing h5ad files"),
+    input_dir: Optional[Path] = typer.Argument(None, help="Directory containing h5ad files (default: ./data/input)"),
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Output directory for parquet files (default: data/output/meta)"),
     fields: Optional[list[str]] = typer.Option(None, "--field", "-f", help="Field name to extract (can be specified multiple times). If not specified, extracts all available metadata fields."),
     chunk_size: int = typer.Option(10000, "--chunk-size", help="Number of rows to process at a time"),
@@ -785,21 +872,31 @@ def batch(
     skip_existing: bool = typer.Option(True, "--skip-existing/--overwrite", help="Skip files that already have output"),
     max_threads: Optional[int] = typer.Option(None, "--max-threads", help="Maximum number of threads for Polars (default: 8, set to 1 for minimal memory)"),
     max_file_size_mb: Optional[float] = typer.Option(None, "--max-file-size-mb", help="Maximum file size in MB to process (e.g., 12000 for 12 GB). Files larger than this will be skipped."),
+    verbose_logging: bool = typer.Option(False, "--verbose/--quiet", help="Enable verbose logging including per-chunk details (default: quiet for batch)"),
 ) -> None:
     """Extract metadata fields from multiple h5ad files in batch.
     
-    By default, extracts all available metadata fields from adata.obs.
+    By default, extracts all available metadata fields from adata.obs from ./data/input directory.
     Specify -f/--field to extract only specific fields.
     
+    Logging: By default, batch mode uses quiet logging (only per-file summaries and errors).
+    Use --verbose to enable detailed per-chunk logging.
+    
     Examples:
-        # Extract all metadata fields from all h5ad files to default location
-        explore batch ./data/input
+        # Extract all metadata fields from default input directory (./data/input)
+        explore batch
+        
+        # Extract from specific directory
+        explore batch ./my/custom/input
         
         # Extract specific fields only
-        explore batch ./data/input -f age -f cell_type -f tissue
+        explore batch -f age -f cell_type -f tissue
         
-        # Specify custom output directory
+        # Specify custom input and output directories
         explore batch ./data/input --output-dir ./custom/output
+        
+        # Enable verbose logging with per-chunk details
+        explore batch --verbose
     """
     # Limit Polars thread pool to prevent memory overload with many files
     # Use half of available cores by default to balance speed and memory
@@ -812,29 +909,39 @@ def batch(
     os.environ['POLARS_MAX_THREADS'] = str(threads)
     typer.echo(f"Using {threads} threads for Polars operations")
     
+    # Use default input directory if not specified
+    if input_dir is None:
+        input_dir = Path("./data/input")
+    
     # Determine output directory
     if output_dir is None:
         output_dir = Path("data/output/meta")
     
-    # Setup logging
+    # Setup logging with datetime stamp to preserve logs from multiple runs
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     if log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
-        json_log = log_dir / "batch_extract.json"
-        rendered_log = log_dir / "batch_extract.log"
+        json_log = log_dir / f"batch_extract_{timestamp}.json"
+        rendered_log = log_dir / f"batch_extract_{timestamp}.log"
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
+        to_nice_stdout(output_file=json_log)
     else:
         # Default to ./logs directory
         default_log_dir = Path("./logs")
         default_log_dir.mkdir(parents=True, exist_ok=True)
-        json_log = default_log_dir / "batch_extract.json"
-        rendered_log = default_log_dir / "batch_extract.log"
+        json_log = default_log_dir / f"batch_extract_{timestamp}.json"
+        rendered_log = default_log_dir / f"batch_extract_{timestamp}.log"
         to_nice_file(output_file=json_log, rendered_file=rendered_log)
+        to_nice_stdout(output_file=json_log)
     
     with start_action(
         action_type="batch_extract_fields",
         input_dir=str(input_dir),
         output_dir=str(output_dir),
-        fields=fields if fields else "all_fields"
+        fields=fields if fields else "all_fields",
+        verbose_logging=verbose_logging
     ) as action:
         # Find all h5ad files
         h5ad_files = list(input_dir.glob("*.h5ad"))
@@ -928,7 +1035,8 @@ def batch(
                         use_pyarrow=True,
                         extract_age=extract_age,
                         age_source_col=age_source_col,
-                        generate_summary=False  # Never generate individual summaries in batch mode
+                        generate_summary=False,  # Never generate individual summaries in batch mode
+                        verbose_logging=verbose_logging  # Use user-specified verbosity (default: False for batch)
                     )
                     success = True
                     message = "success"
@@ -995,228 +1103,39 @@ def batch(
                             # Use lazy API - don't collect until necessary
                             meta_lazy = pl.scan_parquet(meta_file)
                             meta_schema = meta_lazy.collect_schema()
-                            schema_names = set(meta_schema.names())
                             
-                            # Helper function to get first non-null value lazily
-                            def _first_non_null(column: str) -> Any | None:
-                                if column not in schema_names:
-                                    return None
-                                result = (
-                                    meta_lazy
-                                    .select(pl.col(column))
-                                    .filter(pl.col(column).is_not_null())
-                                    .limit(1)
-                                    .collect(streaming=True)
-                                )
-                                if result.height == 0:
-                                    return None
-                                return result[column][0]
-                            
-                            # Get organism from parquet (should be there by default)
-                            organism = _first_non_null('organism')
-                            if organism is None:
-                                organism = 'Homo sapiens'  # Default to human if not specified
-                                summary_action.log(
-                                    message_type="organism_default_to_human",
-                                    dataset_id=dataset_id
-                                )
-                            
-                            # Create summary from metadata using lazy aggregations
-                            summary_data: dict[str, Any] = {}
-                            
-                            # Dataset ID
-                            summary_data["dataset_id"] = dataset_id
-                            
-                            # Organism (put early in the output)
-                            summary_data["organism"] = organism
-                            
-                            # Total cell count (lazy)
+                            # Get total cell count
                             total_cells = meta_lazy.select(pl.len()).collect(streaming=True).item()
-                            summary_data["total_cells"] = total_cells
                             
-                            # Unique donors (lazy)
-                            donor_cols = ['donor_id', 'donor', 'subject_id', 'individual']
-                            donor_col = next((col for col in donor_cols if col in schema_names), None)
-                            if donor_col:
-                                unique_donors = (
-                                    meta_lazy
-                                    .select(pl.col(donor_col).n_unique())
-                                    .collect(streaming=True)
-                                    .item()
-                                )
-                                summary_data["unique_donors"] = unique_donors
+                            # Build aggregation expressions for simple stats
+                            exprs, _ = _build_summary_expressions(meta_schema, total_cells)
                             
-                            # Tissues with counts (lazy)
-                            tissue_cols = ['tissue', 'tissue_type', 'organ', 'tissue_general']
-                            tissue_col = next((col for col in tissue_cols if col in schema_names), None)
-                            if tissue_col:
-                                tissue_counts = (
-                                    meta_lazy
-                                    .group_by(tissue_col)
-                                    .agg(pl.len().alias('count'))
-                                    .sort('count', descending=True)
-                                    .collect(streaming=True)
-                                )
-                                summary_data["unique_tissues"] = tissue_counts.height
-                                tissue_list = [
-                                    f"{row[tissue_col]}: {row['count']}"
-                                    for row in tissue_counts.iter_rows(named=True)
-                                    if row[tissue_col] is not None
-                                ]
-                                summary_data["tissues"] = ", ".join(tissue_list)
+                            # Override dataset_id with the one from filename (first expression is dataset_id)
+                            # Replace the dataset_id expression with literal from filename
+                            exprs_updated = []
+                            for expr in exprs:
+                                # Check if this is the dataset_id column by trying to get its alias
+                                try:
+                                    output_name = expr.meta.output_name()
+                                    if output_name == 'dataset_id':
+                                        exprs_updated.append(pl.lit(dataset_id).alias('dataset_id'))
+                                    else:
+                                        exprs_updated.append(expr)
+                                except Exception:
+                                    exprs_updated.append(expr)
                             
-                            # Cell types with counts (lazy)
-                            cell_type_cols = ['cell_type', 'cell_type_ontology_term_id', 'celltype']
-                            cell_type_col = next((col for col in cell_type_cols if col in schema_names), None)
-                            if cell_type_col:
-                                cell_type_counts = (
-                                    meta_lazy
-                                    .group_by(cell_type_col)
-                                    .agg(pl.len().alias('count'))
-                                    .sort('count', descending=True)
-                                    .collect(streaming=True)
-                                )
-                                summary_data["unique_cell_types"] = cell_type_counts.height
-                                cell_type_list = [
-                                    f"{row[cell_type_col]}: {row['count']}"
-                                    for row in cell_type_counts.iter_rows(named=True)
-                                    if row[cell_type_col] is not None
-                                ]
-                                summary_data["cell_types"] = ", ".join(cell_type_list)
+                            # Create base summary with simple aggregations
+                            summary_df = meta_lazy.select(exprs_updated).collect(streaming=True)
                             
-                            # Assays with counts (lazy)
-                            assay_cols = ['assay', 'assay_ontology_term_id', 'technology', 'platform']
-                            assay_col = next((col for col in assay_cols if col in schema_names), None)
-                            if assay_col:
-                                assay_counts = (
-                                    meta_lazy
-                                    .group_by(assay_col)
-                                    .agg(pl.len().alias('count'))
-                                    .sort('count', descending=True)
-                                    .collect(streaming=True)
-                                )
-                                summary_data["unique_assays"] = assay_counts.height
-                                assay_list = [
-                                    f"{row[assay_col]}: {row['count']}"
-                                    for row in assay_counts.iter_rows(named=True)
-                                    if row[assay_col] is not None
-                                ]
-                                summary_data["assays"] = ", ".join(assay_list)
+                            # Add categorical summaries (tissues, cell types, etc.)
+                            summary_df = _add_categorical_summaries(summary_df, meta_lazy, meta_schema)
                             
-                            # Sex with counts (lazy)
-                            sex_cols = ['sex', 'sex_ontology_term_id', 'gender']
-                            sex_col = next((col for col in sex_cols if col in schema_names), None)
-                            if sex_col:
-                                sex_counts = (
-                                    meta_lazy
-                                    .group_by(sex_col)
-                                    .agg(pl.len().alias('count'))
-                                    .sort('count', descending=True)
-                                    .collect(streaming=True)
-                                )
-                                summary_data["unique_sexes"] = sex_counts.height
-                                sex_list = [
-                                    f"{row[sex_col]}: {row['count']}"
-                                    for row in sex_counts.iter_rows(named=True)
-                                    if row[sex_col] is not None
-                                ]
-                                summary_data["sexes"] = ", ".join(sex_list)
-                            
-                            # Diseases with counts (lazy)
-                            disease_cols = ['disease', 'disease_ontology_term_id', 'condition']
-                            disease_col = next((col for col in disease_cols if col in schema_names), None)
-                            if disease_col:
-                                disease_counts = (
-                                    meta_lazy
-                                    .group_by(disease_col)
-                                    .agg(pl.len().alias('count'))
-                                    .sort('count', descending=True)
-                                    .collect(streaming=True)
-                                )
-                                summary_data["unique_diseases"] = disease_counts.height
-                                disease_list = [
-                                    f"{row[disease_col]}: {row['count']}"
-                                    for row in disease_counts.iter_rows(named=True)
-                                    if row[disease_col] is not None
-                                ]
-                                summary_data["diseases"] = ", ".join(disease_list)
-                            
-                            # Age statistics (lazy)
-                            if 'age_years' in schema_names:
-                                age_years_stats = (
-                                    meta_lazy
-                                    .filter(pl.col('age_years').is_not_null())
-                                    .select([
-                                        pl.col('age_years').min().alias('min_age'),
-                                        pl.col('age_years').max().alias('max_age'),
-                                        pl.col('age_years').mean().alias('mean_age'),
-                                        pl.len().alias('count')
-                                    ])
-                                    .collect(streaming=True)
-                                )
-                                count_years = int(age_years_stats['count'][0])
-                                if count_years > 0:
-                                    summary_data["age_years_min"] = age_years_stats['min_age'][0]
-                                    summary_data["age_years_max"] = age_years_stats['max_age'][0]
-                                    summary_data["age_years_mean"] = round(age_years_stats['mean_age'][0], 2)
-                                    unique_ages_df = (
-                                        meta_lazy
-                                        .filter(pl.col('age_years').is_not_null())
-                                        .select(pl.col('age_years'))
-                                        .unique()
-                                        .sort('age_years')
-                                        .collect(streaming=True)
-                                    )
-                                    unique_ages = sorted([val for val in unique_ages_df['age_years'].to_list() if val is not None])
-                                    summary_data["unique_ages_years"] = ", ".join(str(age) for age in unique_ages)
-                                    summary_data["cells_with_age_years"] = count_years
-                            
-                            if 'age_months' in schema_names:
-                                age_months_stats = (
-                                    meta_lazy
-                                    .filter(pl.col('age_months').is_not_null())
-                                    .select([
-                                        pl.col('age_months').min().alias('min_age'),
-                                        pl.col('age_months').max().alias('max_age'),
-                                        pl.col('age_months').mean().alias('mean_age'),
-                                        pl.len().alias('count')
-                                    ])
-                                    .collect(streaming=True)
-                                )
-                                count_months = int(age_months_stats['count'][0])
-                                if count_months > 0:
-                                    summary_data["age_months_min"] = age_months_stats['min_age'][0]
-                                    summary_data["age_months_max"] = age_months_stats['max_age'][0]
-                                    summary_data["age_months_mean"] = round(age_months_stats['mean_age'][0], 2)
-                                    unique_ages_m_df = (
-                                        meta_lazy
-                                        .filter(pl.col('age_months').is_not_null())
-                                        .select(pl.col('age_months'))
-                                        .unique()
-                                        .sort('age_months')
-                                        .collect(streaming=True)
-                                    )
-                                    unique_ages_m = sorted([val for val in unique_ages_m_df['age_months'].to_list() if val is not None])
-                                    summary_data["unique_ages_months"] = ", ".join(str(age) for age in unique_ages_m)
-                                    summary_data["cells_with_age_months"] = count_months
-                            
-                            # Collection info at the end (if available) - lazy
-                            collection_id_value = _first_non_null('collection_id')
-                            summary_data["collection_id"] = collection_id_value
-                            
-                            publication_title = _first_non_null('publication_title')
-                            summary_data["publication_title"] = publication_title
-                            
-                            publication_doi = _first_non_null('publication_doi')
-                            summary_data["publication_doi"] = publication_doi
-                            
-                            # Create summary dataframe and write immediately
-                            summary_df = pl.DataFrame([summary_data])
+                            # Write summary to temp file
                             summary_file = summary_temp_dir / f"summary_{idx:04d}.parquet"
                             summary_df.write_parquet(summary_file)
                             
                             # Clean up
-                            del meta_lazy, summary_df, summary_data
+                            del meta_lazy, summary_df
                             
                         except Exception as e:
                             summary_action.log(
