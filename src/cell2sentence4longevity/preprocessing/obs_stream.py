@@ -71,7 +71,7 @@ def _read_dataset_slice(
     return data
 
 
-git def _decode_string_array(values: np.ndarray) -> np.ndarray:
+def _decode_string_array(values: np.ndarray) -> np.ndarray:
     if values.dtype.kind in {"S", "O"}:
         decoded = np.empty(len(values), dtype=object)
         for idx, value in enumerate(values):
