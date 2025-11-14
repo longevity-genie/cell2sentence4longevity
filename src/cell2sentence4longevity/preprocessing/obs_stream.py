@@ -71,6 +71,39 @@ def _read_dataset_slice(
     return data
 
 
+git def _decode_string_array(values: np.ndarray) -> np.ndarray:
+    if values.dtype.kind in {"S", "O"}:
+        decoded = np.empty(len(values), dtype=object)
+        for idx, value in enumerate(values):
+            decoded[idx] = _decode_scalar(value)
+        return decoded
+    if values.dtype.kind == "U":
+        return values.astype(object)
+    return values
+
+
+def _read_nullable_group_slice(
+    field_node: h5py.Group,
+    field_name: str,
+    start_idx: int,
+    end_idx: int
+) -> np.ndarray:
+    if "values" not in field_node or "mask" not in field_node:
+        msg = f"Nullable obs field '{field_name}' is missing required datasets"
+        raise ValueError(msg)
+    values = field_node["values"][start_idx:end_idx]
+    mask = field_node["mask"][start_idx:end_idx]
+    values_array = _ensure_numpy_array(values)
+    if values_array.dtype.kind in {"S", "O", "U"}:
+        values_array = _decode_string_array(values_array)
+    mask_array = np.asarray(mask, dtype=bool)
+    if mask_array.size == 0 or not mask_array.any():
+        return values_array
+    result = values_array.astype(object, copy=True)
+    result[mask_array] = None
+    return result
+
+
 def _read_obs_field_slice(
     field_node: h5py.Dataset | h5py.Group,
     field_name: str,
@@ -87,6 +120,11 @@ def _read_obs_field_slice(
             categorical_cache[field_name] = _load_categorical_values(field_node)
         categories = categorical_cache[field_name]
         return _decode_categorical_codes(field_node, categories, start_idx, end_idx)
+    if encoding_type in {"nullable-boolean", "nullable-integer", "nullable-string-array"}:
+        if not isinstance(field_node, h5py.Group):
+            msg = f"Unexpected nullable node type for field '{field_name}'"
+            raise ValueError(msg)
+        return _read_nullable_group_slice(field_node, field_name, start_idx, end_idx)
     if not isinstance(field_node, h5py.Dataset):
         msg = f"Unsupported obs field storage for '{field_name}'"
         raise ValueError(msg)
@@ -244,6 +282,8 @@ def preload_complex_obs_fields(
         is_dataset = isinstance(node, h5py.Dataset)
         if is_dataset or encoding_type == "categorical":
             continue
+        if encoding_type in {"nullable-boolean", "nullable-integer", "nullable-string-array"}:
+            continue
         try:
             values = read_elem(node)
         except Exception as exc:
@@ -270,7 +310,7 @@ def infer_obs_schema(obs_group: h5py.Group) -> dict[str, pl.datatypes.DataType]:
         if name == "index":
             continue
         encoding_type = node.attrs.get("encoding-type", "array")
-        if encoding_type in {"categorical", "string-array"}:
+        if encoding_type in {"categorical", "string-array", "nullable-string-array"}:
             schema[name] = pl.String
             continue
         if encoding_type == "nullable-boolean":
@@ -278,9 +318,6 @@ def infer_obs_schema(obs_group: h5py.Group) -> dict[str, pl.datatypes.DataType]:
             continue
         if encoding_type == "nullable-integer":
             schema[name] = pl.Int64
-            continue
-        if encoding_type == "nullable-string-array":
-            schema[name] = pl.String
             continue
         if not isinstance(node, h5py.Dataset):
             continue
