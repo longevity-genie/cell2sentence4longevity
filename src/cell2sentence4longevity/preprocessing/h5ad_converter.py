@@ -721,17 +721,18 @@ def convert_h5ad_to_parquet(
                 # Process a batch
                 batch_end = min(cell_idx + batch_size, n_cells)
 
-                # Create cell sentences for batch without materializing a large dense block
-                # This keeps memory bounded even for very wide matrices or large h5ad files.
+                # Create cell sentences for batch using a dense block slice of adata.X.
+                # This is significantly faster than per-row indexing while keeping
+                # memory bounded by the configured batch_size.
                 batch_sentence_results: list[dict[str, str]] = []
-                for row_idx in range(cell_idx, batch_end):
-                    cell_row = adata.X[row_idx]
-                    # For sparse matrices, getrow().toarray() returns a small dense vector
-                    if hasattr(cell_row, "toarray"):
-                        cell_expr = cell_row.toarray().ravel()
-                    else:
-                        # Dense backend: rely on numpy array view
-                        cell_expr = np.asarray(cell_row).ravel()
+                cell_block = adata.X[cell_idx:batch_end]
+                if hasattr(cell_block, "toarray"):
+                    cell_block = cell_block.toarray()
+                else:
+                    cell_block = np.asarray(cell_block)
+
+                for local_idx in range(cell_block.shape[0]):
+                    cell_expr = np.asarray(cell_block[local_idx]).ravel()
                     batch_sentence_results.append(
                         create_cell_sentence(cell_expr, gene_symbols, top_genes)
                     )
@@ -835,7 +836,7 @@ def convert_h5ad_to_parquet(
             
             n_chunks = chunk_idx
         else:
-            # Row-based chunking (original logic)
+            # Row-based chunking (original logic, optimized to use block slices of adata.X)
             n_chunks = (n_cells + chunk_size - 1) // chunk_size
             action.log(message_type="using_row_based_chunking", chunk_size=chunk_size, n_chunks=n_chunks)
             
@@ -844,15 +845,18 @@ def convert_h5ad_to_parquet(
                     start_idx = chunk_idx * chunk_size
                     end_idx = min(start_idx + chunk_size, n_cells)
                     
-                    # Create cell sentences for each cell in chunk without creating a large dense block.
-                    # This keeps memory bounded even for very wide matrices or extremely large h5ad files.
+                    # Create cell sentences for each cell in chunk using a dense block
+                    # slice of adata.X instead of per-row indexing. This is much faster
+                    # while still keeping memory bounded by chunk_size.
                     chunk_sentence_results: list[dict[str, str]] = []
-                    for row_idx in range(start_idx, end_idx):
-                        cell_row = adata.X[row_idx]
-                        if hasattr(cell_row, "toarray"):
-                            cell_expr = cell_row.toarray().ravel()
-                        else:
-                            cell_expr = np.asarray(cell_row).ravel()
+                    cell_block = adata.X[start_idx:end_idx]
+                    if hasattr(cell_block, "toarray"):
+                        cell_block = cell_block.toarray()
+                    else:
+                        cell_block = np.asarray(cell_block)
+
+                    for local_idx in range(cell_block.shape[0]):
+                        cell_expr = np.asarray(cell_block[local_idx]).ravel()
                         chunk_sentence_results.append(
                             create_cell_sentence(cell_expr, gene_symbols, top_genes)
                         )
@@ -1216,15 +1220,18 @@ def convert_h5ad_to_train_test(
                 start_idx = chunk_idx * chunk_size
                 end_idx = min(start_idx + chunk_size, n_cells)
                 
-                # Create cell sentences for each cell in chunk without materializing a large dense block.
-                # This keeps memory bounded even for very wide matrices or very large h5ad files.
+                # Create cell sentences for each cell in chunk using a dense block slice
+                # of adata.X instead of per-row indexing. This is much faster while
+                # keeping memory bounded by chunk_size.
                 sentence_results: list[dict[str, str]] = []
-                for row_idx in range(start_idx, end_idx):
-                    cell_row = adata.X[row_idx]
-                    if hasattr(cell_row, "toarray"):
-                        cell_expr = cell_row.toarray().ravel()
-                    else:
-                        cell_expr = np.asarray(cell_row).ravel()
+                cell_block = adata.X[start_idx:end_idx]
+                if hasattr(cell_block, "toarray"):
+                    cell_block = cell_block.toarray()
+                else:
+                    cell_block = np.asarray(cell_block)
+
+                for local_idx in range(cell_block.shape[0]):
+                    cell_expr = np.asarray(cell_block[local_idx]).ravel()
                     sentence_results.append(
                         create_cell_sentence(
                             cell_expr,

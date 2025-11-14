@@ -86,7 +86,7 @@ def _build_summary_expressions(
         exprs.extend([
             pl.col('age_years').min().alias('age_years_min'),
             pl.col('age_years').max().alias('age_years_max'),
-            pl.col('age_years').mean().alias('age_years_mean'),
+            pl.col('age_years').mean().round(2).alias('age_years_mean'),
             pl.col('age_years').is_not_null().sum().alias('cells_with_age_years')
         ])
     else:
@@ -101,7 +101,7 @@ def _build_summary_expressions(
         exprs.extend([
             pl.col('age_months').min().alias('age_months_min'),
             pl.col('age_months').max().alias('age_months_max'),
-            pl.col('age_months').mean().alias('age_months_mean'),
+            pl.col('age_months').mean().round(2).alias('age_months_mean'),
             pl.col('age_months').is_not_null().sum().alias('cells_with_age_months')
         ])
     else:
@@ -303,6 +303,37 @@ def _add_categorical_summaries(
         )
     
     return summary_df
+
+
+def _mask_age_months_for_non_mouse(summary_df: pl.DataFrame) -> pl.DataFrame:
+    """Ensure age-in-months summary columns are only populated for mouse datasets.
+    
+    For rows where organism is not 'Mus musculus', all age_months-related columns
+    are set to null while keeping the columns present in the schema.
+    """
+    if 'organism' not in summary_df.columns:
+        return summary_df
+
+    age_months_columns = [
+        'age_months_min',
+        'age_months_max',
+        'age_months_mean',
+        'cells_with_age_months',
+        'unique_ages_months',
+    ]
+    existing_age_months_columns = [
+        column for column in age_months_columns if column in summary_df.columns
+    ]
+    if not existing_age_months_columns:
+        return summary_df
+
+    return summary_df.with_columns([
+        pl.when(pl.col('organism') == 'Mus musculus')
+        .then(pl.col(column))
+        .otherwise(None)
+        .alias(column)
+        for column in existing_age_months_columns
+    ])
 
 
 def _coerce_all_null_object_columns(
@@ -746,6 +777,7 @@ def extract_fields_from_h5ad(
                 
                 # Add categorical summaries (tissues, cell types, etc.)
                 summary_df = _add_categorical_summaries(summary_df, summary_lazy, summary_schema)
+                summary_df = _mask_age_months_for_non_mouse(summary_df)
                 
                 # Log statistics
                 if 'dataset_id' in summary_df.columns:
@@ -1129,6 +1161,7 @@ def batch(
                             
                             # Add categorical summaries (tissues, cell types, etc.)
                             summary_df = _add_categorical_summaries(summary_df, meta_lazy, meta_schema)
+                            summary_df = _mask_age_months_for_non_mouse(summary_df)
                             
                             # Write summary to temp file
                             summary_file = summary_temp_dir / f"summary_{idx:04d}.parquet"
@@ -1173,6 +1206,7 @@ def batch(
                         for organism in organisms:
                             if organism and organism != 'unknown':
                                 organism_summaries = combined.filter(pl.col('organism') == organism)
+                                organism_summaries = _mask_age_months_for_non_mouse(organism_summaries)
                                 
                                 # Create filename: replace spaces with underscores, lowercase
                                 safe_organism = organism.lower().replace(' ', '_').replace('-', '_')
