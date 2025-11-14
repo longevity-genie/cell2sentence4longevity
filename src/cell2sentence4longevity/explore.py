@@ -65,21 +65,9 @@ def _build_summary_expressions(
     else:
         exprs.append(pl.lit(None, dtype=pl.Int64).alias('unique_donors'))
     
-    # Collection info (first non-null values)
-    if 'collection_id' in schema:
-        exprs.append(pl.col('collection_id').filter(pl.col('collection_id').is_not_null()).first().alias('collection_id'))
-    else:
-        exprs.append(pl.lit(None, dtype=pl.String).alias('collection_id'))
-    
-    if 'publication_title' in schema:
-        exprs.append(pl.col('publication_title').filter(pl.col('publication_title').is_not_null()).first().alias('publication_title'))
-    else:
-        exprs.append(pl.lit(None, dtype=pl.String).alias('publication_title'))
-    
-    if 'publication_doi' in schema:
-        exprs.append(pl.col('publication_doi').filter(pl.col('publication_doi').is_not_null()).first().alias('publication_doi'))
-    else:
-        exprs.append(pl.lit(None, dtype=pl.String).alias('publication_doi'))
+    # Note: Collection info (collection_id, publication_title, publication_doi, etc.) 
+    # will be added via left-join with collections cache in batch mode
+    # No need to extract them from individual meta files here
     
     # Age statistics
     if 'age_years' in schema:
@@ -1192,6 +1180,22 @@ def batch(
                         combined = pl.concat(all_summaries_list, how="diagonal_relaxed")
                         del all_summaries_list
                         gc.collect()
+                        
+                        # Left-join with collections cache to add publication metadata
+                        if 'dataset_id' in combined.columns:
+                            from cell2sentence4longevity.preprocessing.publication_lookup import join_with_collections
+                            try:
+                                combined = join_with_collections(combined)
+                                summary_action.log(
+                                    message_type="joined_with_collections",
+                                    note="Added publication metadata via left-join with collections cache"
+                                )
+                            except Exception as e:
+                                summary_action.log(
+                                    message_type="collection_join_warning",
+                                    error=str(e),
+                                    note="Failed to join with collections, continuing without publication metadata"
+                                )
                         
                         # Sort by cells_with_age_years (descending), putting datasets with more age data first
                         # Fill null values with 0 for sorting
