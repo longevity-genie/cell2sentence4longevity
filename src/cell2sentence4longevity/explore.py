@@ -234,6 +234,15 @@ def extract_fields_from_h5ad(
                             chunk_df,
                             development_stage_col=age_source_col
                         )
+                        # Ensure both age columns exist in all chunks for consistent schema
+                        # This prevents schema mismatch errors when scanning parquet files
+                        age_columns_to_add = []
+                        if 'age_years' not in chunk_df.columns:
+                            age_columns_to_add.append(pl.lit(None).cast(pl.Float64).alias('age_years'))
+                        if 'age_months' not in chunk_df.columns:
+                            age_columns_to_add.append(pl.lit(None).cast(pl.Float64).alias('age_months'))
+                        if age_columns_to_add:
+                            chunk_df = chunk_df.with_columns(age_columns_to_add)
                     
                     # Write chunk to temp file
                     chunk_file = temp_dir / f"chunk_{chunk_idx:04d}.parquet"
@@ -278,8 +287,44 @@ def extract_fields_from_h5ad(
         
         # Read all chunks lazily without materializing full dataset
         action.log(message_type="building_lazy_dataframe", n_chunks=n_chunks)
-        final_lazy_df = pl.scan_parquet(temp_dir / "*.parquet")
-        schema_names = set(final_lazy_df.collect_schema().names())
+        try:
+            final_lazy_df = pl.scan_parquet(temp_dir / "*.parquet")
+            schema_names = set(final_lazy_df.collect_schema().names())
+        except Exception as e:
+            error_msg = str(e)
+            # Extract column name from Polars schema mismatch errors
+            column_name = None
+            if "extra column in file outside of expected schema:" in error_msg:
+                # Format: "extra column in file outside of expected schema: column_name, hint: ..."
+                parts = error_msg.split("extra column in file outside of expected schema:")
+                if len(parts) > 1:
+                    column_part = parts[1].split(",")[0].strip()
+                    column_name = column_part
+            elif "missing column" in error_msg.lower():
+                # Try to extract column name from missing column errors
+                parts = error_msg.split("missing column")
+                if len(parts) > 1:
+                    column_part = parts[1].split()[0].strip().rstrip(":")
+                    column_name = column_part
+            
+            if column_name:
+                action.log(
+                    message_type="schema_mismatch_error",
+                    error=error_msg,
+                    column_name=column_name,
+                    temp_dir=str(temp_dir)
+                )
+                raise ValueError(
+                    f"Schema mismatch when reading parquet chunks: column '{column_name}' is present in some chunks but not others. "
+                    f"Original error: {error_msg}"
+                ) from e
+            else:
+                action.log(
+                    message_type="parquet_scan_error",
+                    error=error_msg,
+                    temp_dir=str(temp_dir)
+                )
+                raise
         
         # Join with collections if applicable
         collection_columns = ['collection_id', 'publication_title', 'publication_doi']
@@ -360,7 +405,7 @@ def extract_fields_from_h5ad(
             action.log(message_type="temp_dir_cleaned", temp_dir=str(temp_dir))
         
         written_lazy_df = pl.scan_parquet(output_path)
-        written_schema = written_lazy_df.schema
+        written_schema = written_lazy_df.collect_schema()
         
         if extract_age:
             age_exprs = []
@@ -391,7 +436,7 @@ def extract_fields_from_h5ad(
         if generate_summary:
             summary_path = output_path.with_name(output_path.stem + "_summary.csv")
             summary_lazy = written_lazy_df
-            summary_schema = summary_lazy.schema
+            summary_schema = summary_lazy.collect_schema()
             
             def _first_non_null(column: str) -> Any | None:
                 if column not in summary_schema:
@@ -734,7 +779,7 @@ def batch(
     compression_level: int = typer.Option(3, "--compression-level", help="Compression level"),
     extract_age: bool = typer.Option(True, "--extract-age/--no-extract-age", help="Extract age from development_stage column"),
     age_source_col: str = typer.Option("development_stage", "--age-source", help="Column to extract age from"),
-    generate_summary: bool = typer.Option(False, "--summary/--no-summary", help="Generate species-level summary files"),
+    generate_summary: bool = typer.Option(True, "--summary/--no-summary", help="Generate species-level summary files"),
     summary_format: str = typer.Option("csv", "--summary-format", help="Format for summary files: 'csv' or 'tsv' (default: csv)"),
     log_dir: Optional[Path] = typer.Option(None, "--log-dir", help="Directory for log files"),
     skip_existing: bool = typer.Option(True, "--skip-existing/--overwrite", help="Skip files that already have output"),
@@ -945,31 +990,30 @@ def batch(
                     
                     for idx, meta_file in enumerate(meta_files):
                         dataset_id = meta_file.stem.replace("_meta", "")
-                        h5ad_file = input_dir / f"{dataset_id}.h5ad"
                         
                         try:
-                            # Read metadata (only what we need)
-                            meta_df = pl.scan_parquet(meta_file).collect()
+                            # Use lazy API - don't collect until necessary
+                            meta_lazy = pl.scan_parquet(meta_file)
+                            meta_schema = meta_lazy.collect_schema()
+                            schema_names = set(meta_schema.names())
                             
-                            # Get organism
-                            organism = None
-                            if 'organism' in meta_df.columns:
-                                organism = meta_df['organism'][0]
-                            elif h5ad_file.exists():
-                                # Try to get from h5ad file
-                                try:
-                                    adata = ad.read_h5ad(h5ad_file, backed='r')
-                                    if 'organism' in adata.obs.columns:
-                                        organism = adata.obs['organism'][0]
-                                    adata.file.close()
-                                    del adata
-                                except Exception as e:
-                                    summary_action.log(
-                                        message_type="error_reading_h5ad",
-                                        file=h5ad_file.name,
-                                        error=str(e)
-                                    )
+                            # Helper function to get first non-null value lazily
+                            def _first_non_null(column: str) -> Any | None:
+                                if column not in schema_names:
+                                    return None
+                                result = (
+                                    meta_lazy
+                                    .select(pl.col(column))
+                                    .filter(pl.col(column).is_not_null())
+                                    .limit(1)
+                                    .collect(streaming=True)
+                                )
+                                if result.height == 0:
+                                    return None
+                                return result[column][0]
                             
+                            # Get organism from parquet (should be there by default)
+                            organism = _first_non_null('organism')
                             if organism is None:
                                 organism = 'Homo sapiens'  # Default to human if not specified
                                 summary_action.log(
@@ -977,8 +1021,8 @@ def batch(
                                     dataset_id=dataset_id
                                 )
                             
-                            # Create summary from metadata (same logic as in extract_fields_from_h5ad)
-                            summary_data: dict[str, any] = {}
+                            # Create summary from metadata using lazy aggregations
+                            summary_data: dict[str, Any] = {}
                             
                             # Dataset ID
                             summary_data["dataset_id"] = dataset_id
@@ -986,88 +1030,185 @@ def batch(
                             # Organism (put early in the output)
                             summary_data["organism"] = organism
                             
-                            # Total cell count
-                            summary_data["total_cells"] = len(meta_df)
+                            # Total cell count (lazy)
+                            total_cells = meta_lazy.select(pl.len()).collect(streaming=True).item()
+                            summary_data["total_cells"] = total_cells
                             
-                            # Unique donors
+                            # Unique donors (lazy)
                             donor_cols = ['donor_id', 'donor', 'subject_id', 'individual']
-                            donor_col = next((col for col in donor_cols if col in meta_df.columns), None)
+                            donor_col = next((col for col in donor_cols if col in schema_names), None)
                             if donor_col:
-                                summary_data["unique_donors"] = meta_df[donor_col].n_unique()
+                                unique_donors = (
+                                    meta_lazy
+                                    .select(pl.col(donor_col).n_unique())
+                                    .collect(streaming=True)
+                                    .item()
+                                )
+                                summary_data["unique_donors"] = unique_donors
                             
-                            # Tissues with counts
+                            # Tissues with counts (lazy)
                             tissue_cols = ['tissue', 'tissue_type', 'organ', 'tissue_general']
-                            tissue_col = next((col for col in tissue_cols if col in meta_df.columns), None)
+                            tissue_col = next((col for col in tissue_cols if col in schema_names), None)
                             if tissue_col:
-                                tissue_counts = meta_df.group_by(tissue_col).agg(pl.len().alias('count')).sort('count', descending=True)
+                                tissue_counts = (
+                                    meta_lazy
+                                    .group_by(tissue_col)
+                                    .agg(pl.len().alias('count'))
+                                    .sort('count', descending=True)
+                                    .collect(streaming=True)
+                                )
                                 summary_data["unique_tissues"] = tissue_counts.height
-                                tissue_list = [f"{row[tissue_col]}: {row['count']}" for row in tissue_counts.iter_rows(named=True) if row[tissue_col] is not None]
+                                tissue_list = [
+                                    f"{row[tissue_col]}: {row['count']}"
+                                    for row in tissue_counts.iter_rows(named=True)
+                                    if row[tissue_col] is not None
+                                ]
                                 summary_data["tissues"] = ", ".join(tissue_list)
                             
-                            # Cell types with counts
+                            # Cell types with counts (lazy)
                             cell_type_cols = ['cell_type', 'cell_type_ontology_term_id', 'celltype']
-                            cell_type_col = next((col for col in cell_type_cols if col in meta_df.columns), None)
+                            cell_type_col = next((col for col in cell_type_cols if col in schema_names), None)
                             if cell_type_col:
-                                cell_type_counts = meta_df.group_by(cell_type_col).agg(pl.len().alias('count')).sort('count', descending=True)
+                                cell_type_counts = (
+                                    meta_lazy
+                                    .group_by(cell_type_col)
+                                    .agg(pl.len().alias('count'))
+                                    .sort('count', descending=True)
+                                    .collect(streaming=True)
+                                )
                                 summary_data["unique_cell_types"] = cell_type_counts.height
-                                cell_type_list = [f"{row[cell_type_col]}: {row['count']}" for row in cell_type_counts.iter_rows(named=True) if row[cell_type_col] is not None]
+                                cell_type_list = [
+                                    f"{row[cell_type_col]}: {row['count']}"
+                                    for row in cell_type_counts.iter_rows(named=True)
+                                    if row[cell_type_col] is not None
+                                ]
                                 summary_data["cell_types"] = ", ".join(cell_type_list)
                             
-                            # Assays with counts
+                            # Assays with counts (lazy)
                             assay_cols = ['assay', 'assay_ontology_term_id', 'technology', 'platform']
-                            assay_col = next((col for col in assay_cols if col in meta_df.columns), None)
+                            assay_col = next((col for col in assay_cols if col in schema_names), None)
                             if assay_col:
-                                assay_counts = meta_df.group_by(assay_col).agg(pl.len().alias('count')).sort('count', descending=True)
+                                assay_counts = (
+                                    meta_lazy
+                                    .group_by(assay_col)
+                                    .agg(pl.len().alias('count'))
+                                    .sort('count', descending=True)
+                                    .collect(streaming=True)
+                                )
                                 summary_data["unique_assays"] = assay_counts.height
-                                assay_list = [f"{row[assay_col]}: {row['count']}" for row in assay_counts.iter_rows(named=True) if row[assay_col] is not None]
+                                assay_list = [
+                                    f"{row[assay_col]}: {row['count']}"
+                                    for row in assay_counts.iter_rows(named=True)
+                                    if row[assay_col] is not None
+                                ]
                                 summary_data["assays"] = ", ".join(assay_list)
                             
-                            # Sex with counts
+                            # Sex with counts (lazy)
                             sex_cols = ['sex', 'sex_ontology_term_id', 'gender']
-                            sex_col = next((col for col in sex_cols if col in meta_df.columns), None)
+                            sex_col = next((col for col in sex_cols if col in schema_names), None)
                             if sex_col:
-                                sex_counts = meta_df.group_by(sex_col).agg(pl.len().alias('count')).sort('count', descending=True)
+                                sex_counts = (
+                                    meta_lazy
+                                    .group_by(sex_col)
+                                    .agg(pl.len().alias('count'))
+                                    .sort('count', descending=True)
+                                    .collect(streaming=True)
+                                )
                                 summary_data["unique_sexes"] = sex_counts.height
-                                sex_list = [f"{row[sex_col]}: {row['count']}" for row in sex_counts.iter_rows(named=True) if row[sex_col] is not None]
+                                sex_list = [
+                                    f"{row[sex_col]}: {row['count']}"
+                                    for row in sex_counts.iter_rows(named=True)
+                                    if row[sex_col] is not None
+                                ]
                                 summary_data["sexes"] = ", ".join(sex_list)
                             
-                            # Diseases with counts
+                            # Diseases with counts (lazy)
                             disease_cols = ['disease', 'disease_ontology_term_id', 'condition']
-                            disease_col = next((col for col in disease_cols if col in meta_df.columns), None)
+                            disease_col = next((col for col in disease_cols if col in schema_names), None)
                             if disease_col:
-                                disease_counts = meta_df.group_by(disease_col).agg(pl.len().alias('count')).sort('count', descending=True)
+                                disease_counts = (
+                                    meta_lazy
+                                    .group_by(disease_col)
+                                    .agg(pl.len().alias('count'))
+                                    .sort('count', descending=True)
+                                    .collect(streaming=True)
+                                )
                                 summary_data["unique_diseases"] = disease_counts.height
-                                disease_list = [f"{row[disease_col]}: {row['count']}" for row in disease_counts.iter_rows(named=True) if row[disease_col] is not None]
+                                disease_list = [
+                                    f"{row[disease_col]}: {row['count']}"
+                                    for row in disease_counts.iter_rows(named=True)
+                                    if row[disease_col] is not None
+                                ]
                                 summary_data["diseases"] = ", ".join(disease_list)
                             
-                            # Age statistics
-                            if 'age_years' in meta_df.columns:
-                                age_years_data = meta_df.filter(pl.col('age_years').is_not_null())
-                                if len(age_years_data) > 0:
-                                    summary_data["age_years_min"] = age_years_data['age_years'].min()
-                                    summary_data["age_years_max"] = age_years_data['age_years'].max()
-                                    summary_data["age_years_mean"] = round(age_years_data['age_years'].mean(), 2)
-                                    unique_ages = sorted(age_years_data['age_years'].unique().to_list())
+                            # Age statistics (lazy)
+                            if 'age_years' in schema_names:
+                                age_years_stats = (
+                                    meta_lazy
+                                    .filter(pl.col('age_years').is_not_null())
+                                    .select([
+                                        pl.col('age_years').min().alias('min_age'),
+                                        pl.col('age_years').max().alias('max_age'),
+                                        pl.col('age_years').mean().alias('mean_age'),
+                                        pl.len().alias('count')
+                                    ])
+                                    .collect(streaming=True)
+                                )
+                                count_years = int(age_years_stats['count'][0])
+                                if count_years > 0:
+                                    summary_data["age_years_min"] = age_years_stats['min_age'][0]
+                                    summary_data["age_years_max"] = age_years_stats['max_age'][0]
+                                    summary_data["age_years_mean"] = round(age_years_stats['mean_age'][0], 2)
+                                    unique_ages_df = (
+                                        meta_lazy
+                                        .filter(pl.col('age_years').is_not_null())
+                                        .select(pl.col('age_years'))
+                                        .unique()
+                                        .sort('age_years')
+                                        .collect(streaming=True)
+                                    )
+                                    unique_ages = sorted([val for val in unique_ages_df['age_years'].to_list() if val is not None])
                                     summary_data["unique_ages_years"] = ", ".join(str(age) for age in unique_ages)
-                                    summary_data["cells_with_age_years"] = len(age_years_data)
+                                    summary_data["cells_with_age_years"] = count_years
                             
-                            if 'age_months' in meta_df.columns:
-                                age_months_data = meta_df.filter(pl.col('age_months').is_not_null())
-                                if len(age_months_data) > 0:
-                                    summary_data["age_months_min"] = age_months_data['age_months'].min()
-                                    summary_data["age_months_max"] = age_months_data['age_months'].max()
-                                    summary_data["age_months_mean"] = round(age_months_data['age_months'].mean(), 2)
-                                    unique_ages_m = sorted(age_months_data['age_months'].unique().to_list())
+                            if 'age_months' in schema_names:
+                                age_months_stats = (
+                                    meta_lazy
+                                    .filter(pl.col('age_months').is_not_null())
+                                    .select([
+                                        pl.col('age_months').min().alias('min_age'),
+                                        pl.col('age_months').max().alias('max_age'),
+                                        pl.col('age_months').mean().alias('mean_age'),
+                                        pl.len().alias('count')
+                                    ])
+                                    .collect(streaming=True)
+                                )
+                                count_months = int(age_months_stats['count'][0])
+                                if count_months > 0:
+                                    summary_data["age_months_min"] = age_months_stats['min_age'][0]
+                                    summary_data["age_months_max"] = age_months_stats['max_age'][0]
+                                    summary_data["age_months_mean"] = round(age_months_stats['mean_age'][0], 2)
+                                    unique_ages_m_df = (
+                                        meta_lazy
+                                        .filter(pl.col('age_months').is_not_null())
+                                        .select(pl.col('age_months'))
+                                        .unique()
+                                        .sort('age_months')
+                                        .collect(streaming=True)
+                                    )
+                                    unique_ages_m = sorted([val for val in unique_ages_m_df['age_months'].to_list() if val is not None])
                                     summary_data["unique_ages_months"] = ", ".join(str(age) for age in unique_ages_m)
-                                    summary_data["cells_with_age_months"] = len(age_months_data)
+                                    summary_data["cells_with_age_months"] = count_months
                             
-                            # Collection info at the end (if available)
-                            if 'collection_id' in meta_df.columns:
-                                summary_data["collection_id"] = meta_df['collection_id'][0]
-                            if 'publication_title' in meta_df.columns:
-                                summary_data["publication_title"] = meta_df['publication_title'][0]
-                            if 'publication_doi' in meta_df.columns:
-                                summary_data["publication_doi"] = meta_df['publication_doi'][0]
+                            # Collection info at the end (if available) - lazy
+                            collection_id_value = _first_non_null('collection_id')
+                            summary_data["collection_id"] = collection_id_value
+                            
+                            publication_title = _first_non_null('publication_title')
+                            summary_data["publication_title"] = publication_title
+                            
+                            publication_doi = _first_non_null('publication_doi')
+                            summary_data["publication_doi"] = publication_doi
                             
                             # Create summary dataframe and write immediately
                             summary_df = pl.DataFrame([summary_data])
@@ -1075,7 +1216,7 @@ def batch(
                             summary_df.write_parquet(summary_file)
                             
                             # Clean up
-                            del meta_df, summary_df, summary_data
+                            del meta_lazy, summary_df, summary_data
                             
                         except Exception as e:
                             summary_action.log(

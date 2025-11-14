@@ -27,8 +27,10 @@ def extract_age_columns(df: pl.DataFrame, development_stage_col: str = 'developm
     - For humans: extracts from patterns like "22-year-old" or "22.5-year-old" -> age_years
     - For mice: extracts from patterns like "24m", "24 month", "2.5m" -> age_months
     - Also checks for existing 'age' field (common in mouse datasets) -> age_months
+    - Preserves existing 'age_years' and 'age_months' columns if they already exist in the dataset
     
     Only adds the age column relevant to the species (age_years for humans, age_months for mice).
+    If age columns already exist, they are preserved and only null values are filled from extraction.
     
     This is much faster than using map_elements as it's fully vectorized.
     
@@ -41,26 +43,46 @@ def extract_age_columns(df: pl.DataFrame, development_stage_col: str = 'developm
     """
     result_df = df
     
+    # Check if age columns already exist - preserve them if they do
+    has_age_years = 'age_years' in df.columns
+    has_age_months = 'age_months' in df.columns
+    
     # Check if organism column exists to determine species
     has_organism = 'organism' in df.columns
     
     if not has_organism:
         # If no organism column, add both columns as we don't know the species
-        result_df = result_df.with_columns([
-            pl.lit(None).cast(pl.Float64).alias('age_years'),
-            pl.lit(None).cast(pl.Float64).alias('age_months')
-        ])
-        
-        # Try to extract from both patterns
-        if development_stage_col in df.columns:
+        # But preserve existing values if columns already exist
+        if not has_age_years:
             result_df = result_df.with_columns([
+                pl.lit(None).cast(pl.Float64).alias('age_years')
+            ])
+        if not has_age_months:
+            result_df = result_df.with_columns([
+                pl.lit(None).cast(pl.Float64).alias('age_months')
+            ])
+        
+        # Try to extract from both patterns, but only fill nulls
+        if development_stage_col in df.columns:
+            extracted_years = (
                 pl.col(development_stage_col)
                 .str.extract(r'(\d+(?:\.\d+)?)-year-old', 1)
                 .cast(pl.Float64, strict=False)
-                .alias('age_years'),
+            )
+            extracted_months = (
                 pl.col(development_stage_col)
                 .str.extract(r'(\d+(?:\.\d+)?)\s*-?\s*m(?:onth)?', 1)
                 .cast(pl.Float64, strict=False)
+            )
+            
+            result_df = result_df.with_columns([
+                pl.when(pl.col('age_years').is_null())
+                .then(extracted_years)
+                .otherwise(pl.col('age_years'))
+                .alias('age_years'),
+                pl.when(pl.col('age_months').is_null())
+                .then(extracted_months)
+                .otherwise(pl.col('age_months'))
                 .alias('age_months')
             ])
         
@@ -82,37 +104,47 @@ def extract_age_columns(df: pl.DataFrame, development_stage_col: str = 'developm
     
     # Extract human age (years) - only if humans present
     if has_humans:
-        result_df = result_df.with_columns(
-            pl.lit(None).cast(pl.Float64).alias('age_years')
-        )
+        if not has_age_years:
+            result_df = result_df.with_columns(
+                pl.lit(None).cast(pl.Float64).alias('age_years')
+            )
         
         if development_stage_col in df.columns:
+            extracted_years = (
+                pl.col(development_stage_col)
+                .str.extract(r'(\d+(?:\.\d+)?)-year-old', 1)
+                .cast(pl.Float64, strict=False)
+            )
             result_df = result_df.with_columns(
-                pl.when(pl.col('organism') == 'Homo sapiens')
-                .then(
-                    pl.col(development_stage_col)
-                    .str.extract(r'(\d+(?:\.\d+)?)-year-old', 1)
-                    .cast(pl.Float64, strict=False)
+                pl.when(
+                    (pl.col('organism') == 'Homo sapiens') & 
+                    (pl.col('age_years').is_null())
                 )
+                .then(extracted_years)
                 .otherwise(pl.col('age_years'))
                 .alias('age_years')
             )
     
     # Extract mouse age (months) - only if mice present
     if has_mice:
-        result_df = result_df.with_columns(
-            pl.lit(None).cast(pl.Float64).alias('age_months')
-        )
+        if not has_age_months:
+            result_df = result_df.with_columns(
+                pl.lit(None).cast(pl.Float64).alias('age_months')
+            )
         
         if development_stage_col in df.columns:
             # Pattern matches "24m", "24 month", "24-month", "2.5m", etc.
+            extracted_months = (
+                pl.col(development_stage_col)
+                .str.extract(r'(\d+(?:\.\d+)?)\s*-?\s*m(?:onth)?', 1)
+                .cast(pl.Float64, strict=False)
+            )
             result_df = result_df.with_columns(
-                pl.when(pl.col('organism') == 'Mus musculus')
-                .then(
-                    pl.col(development_stage_col)
-                    .str.extract(r'(\d+(?:\.\d+)?)\s*-?\s*m(?:onth)?', 1)
-                    .cast(pl.Float64, strict=False)
+                pl.when(
+                    (pl.col('organism') == 'Mus musculus') & 
+                    (pl.col('age_months').is_null())
                 )
+                .then(extracted_months)
                 .otherwise(pl.col('age_months'))
                 .alias('age_months')
             )
